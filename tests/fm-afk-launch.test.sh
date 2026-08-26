@@ -40,6 +40,14 @@ GLOBAL_CLEANUP() {
 }
 trap GLOBAL_CLEANUP EXIT
 
+# bin/fm-afk-start.sh refuses a start that would host the away daemon in the very
+# pane it injects into. Every test below that runs its main is about something
+# else, so they pin a neutral identity - no harness marker, no pane manager -
+# instead of inheriting the test runner's real captain session.
+START_GUARD_CLEAN_ENV=(env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u CLAUDECODE -u PI_CODING_AGENT
+  -u GROK_AGENT -u TMUX_PANE -u FM_SUPERVISOR_TARGET -u FM_SUPERVISOR_BACKEND
+  -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_SESSION)
+
 # ---------------------------------------------------------------------------
 # UNIT 1: fm_afk_clear_stale_artifacts removes exactly the three stale artifacts.
 # ---------------------------------------------------------------------------
@@ -136,7 +144,7 @@ unit_fresh_vs_refresh() {
   mkdir -p "$lock"
   printf '%s' "$sleep_pid" > "$lock/pid"
   ( . "$ROOT/bin/fm-wake-lib.sh"; fm_pid_identity "$sleep_pid" > "$lock/pid-identity" 2>/dev/null ) || true
-  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$START" >/dev/null 2>&1
+  "${START_GUARD_CLEAN_ENV[@]}" FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$START" >/dev/null 2>&1
   if [ -e "$st/state/.subsuper-escalations" ] && [ -e "$st/state/.subsuper-inject-wedged" ]; then
     pass "refresh: daemon already alive - stale artifacts preserved (current session's buffer kept)"
   else
@@ -572,9 +580,6 @@ unit_native_refuses_claude_on_herdr() {
 # comparison is where-am-I vs where-does-injection-land, never the mere
 # presence of a documented env knob.
 # ---------------------------------------------------------------------------
-START_GUARD_CLEAN_ENV=(env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u CLAUDECODE -u PI_CODING_AGENT
-  -u GROK_AGENT -u TMUX_PANE -u FM_SUPERVISOR_TARGET -u FM_SUPERVISOR_BACKEND
-  -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_SESSION)
 
 # Run fm_afk_start_main in a child shell with a harmless daemon stand-in, so a
 # PERMITTED start is observable as its own announcement rather than by execing
@@ -700,7 +705,8 @@ unit_native_entry_preserves_prepared_state() {
   mkdir -p "$st/state"
   : > "$st/state/.afk"
   : > "$st/state/.subsuper-escalations"
-  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_STATE_PREPARED=1 bash -c '
+  "${START_GUARD_CLEAN_ENV[@]}" FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
+    FM_AFK_STATE_PREPARED=1 bash -c '
     . "$1"
     FM_AFK_DAEMON=/bin/true
     fm_afk_start_main
