@@ -1834,6 +1834,47 @@ test_inject_msg_herdr_busy_guard_defers() {
   pass "inject_msg: herdr busy-guard defers before ever attempting a submit"
 }
 
+# The busy-guard deferral line must name WHICH branch of the REAL pane_is_busy
+# decided (2026-08-26 investigation: one indistinguishable "pane busy" line
+# forced a live reproduction of a herdr footer just to answer that from the log
+# alone). Both branches are exercised through the real function - the native
+# agent-state short-circuit and the rendered-pane regex fallback - not a stubbed
+# pane_is_busy, so the label a deferral prints is proven to match the branch
+# that actually produced the verdict.
+test_inject_msg_busy_deferral_log_names_deciding_branch() {
+  local dir state
+  dir=$(make_supercase inject-busy-deferral-branch-label)
+  state="$dir/state"
+  afk_enter "$state"
+  (
+    LOG="$state/native.log"
+    fm_backend_target_exists() { return 0; }
+    fm_backend_busy_state() { printf 'busy'; }
+    fm_backend_capture() { fail "the native busy verdict must not fall through to a capture"; }
+    fm_backend_composer_state() { printf 'pending'; }
+    fm_backend_send_text_submit() { fail "send_text_submit should not run when the busy-guard defers"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg should defer on a native busy verdict with a pending composer"
+    fi
+    assert_grep "supervisor pane busy (native agent-state (agent_status=busy))" "$LOG" \
+      "the deferral line should name the native agent-state branch: $(cat "$LOG" 2>/dev/null)"
+  ) || fail "native-branch deferral-label subshell failed"
+  (
+    LOG="$state/fallback.log"
+    fm_backend_target_exists() { return 0; }
+    fm_backend_busy_state() { printf 'unknown'; }
+    fm_backend_capture() { printf 'crunching data... esc to interrupt\n'; }
+    fm_backend_composer_state() { printf 'pending'; }
+    fm_backend_send_text_submit() { fail "send_text_submit should not run when the busy-guard defers"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg should defer on a rendered-pane busy verdict with a pending composer"
+    fi
+    assert_grep "supervisor pane busy (rendered-pane busy-regex fallback)" "$LOG" \
+      "the deferral line should name the rendered-pane regex fallback: $(cat "$LOG" 2>/dev/null)"
+  ) || fail "fallback-branch deferral-label subshell failed"
+  pass "inject_msg: the busy-guard deferral line names the branch that decided (native agent-state vs rendered-pane regex fallback)"
+}
+
 # Bounding fix (firstmate-afk-daemon-wedged-investigation, 2026-08-26; redesigned
 # again per the escape-clock-measures-total-age review): a busy verdict paired
 # with a PROVABLY EMPTY composer is the exact false-positive the daemon's own
@@ -2507,6 +2548,7 @@ test_primary_busy_guard_is_harness_scoped
 test_pane_is_busy_defaults_to_tmux_when_backend_omitted
 test_pane_input_pending_herdr_dispatch
 test_inject_msg_herdr_busy_guard_defers
+test_inject_msg_busy_deferral_log_names_deciding_branch
 test_inject_msg_herdr_composer_guard_defers
 test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch
