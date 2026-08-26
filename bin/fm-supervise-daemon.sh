@@ -227,6 +227,17 @@ BUSY_GUARD_ESCAPE_SECS_DEFAULT=300
 # inside bash's integer arithmetic instead of risking an overflow on an
 # absurd operator-supplied value.
 BUSY_GUARD_ESCAPE_SECS_MAX=86400
+# Largest gap between two consecutive busy-plus-empty observations that still
+# counts in full toward the escape window. The streak marker records OBSERVED
+# disagreement, and inject_msg only runs when the daemon reaches a delivery
+# attempt: the main loop can skip many ticks (pane gone, crash backoff, a
+# restart between flushes) without observing the pane at all, and that
+# unobserved wall-clock must not accrue toward the escape. Each observation
+# therefore contributes at most one poll interval - HOUSEKEEPING_TICK_DEFAULT,
+# the cadence at which a buffered escalation is retried - so the escape still
+# needs a genuinely continuous run of observations no matter how long the gaps
+# between them were.
+BUSY_EMPTY_STREAK_STEP_MAX=$HOUSEKEEPING_TICK_DEFAULT
 # Resolved once at daemon start by resolve_busy_guard_escape_secs (below);
 # empty until then, in which case inject_msg falls back to the default.
 BUSY_GUARD_ESCAPE_SECS_RESOLVED=
@@ -1212,7 +1223,8 @@ resolve_busy_guard_escape_secs() {
 #     would merge with the human's text.
 inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer encoded \
-        streak_marker streak_age streak_mtime escape_secs escape_fired
+        streak_marker streak_age streak_mtime streak_prev streak_step \
+        escape_secs escape_fired
   state="${2:-$(_state_root)}"
   # The busy-guard escape below measures a CONTINUOUS run of observed
   # busy-verdict-plus-confirmed-empty-composer ticks, so its marker is resolved
@@ -1267,11 +1279,18 @@ inject_msg() {  # <message> [state]
   # unknown, and a bare dead-shell prompt still defer with no escape.
   #
   # The elapsed time measured here is EXACTLY that disagreement and nothing
-  # else: state/.subsuper-busy-empty-streak-since is a durable marker whose
-  # mtime records when the CURRENT continuous run of (busy verdict AND
-  # confirmed-empty composer) observations began. It is created on the first
-  # such observation and removed the instant the streak breaks - on any
-  # composer read that is not exactly 'empty', on any non-busy verdict, and
+  # else: state/.subsuper-busy-empty-streak-since is a durable marker recording
+  # the CURRENT continuous run of (busy verdict AND confirmed-empty composer)
+  # observations - its contents hold the seconds observed so far and its mtime
+  # holds when the last observation was made, so each tick adds only the time
+  # since the previous observation, capped at BUSY_EMPTY_STREAK_STEP_MAX. Time
+  # the daemon never observed the pane at all (the main loop's pane-gone
+  # backoff, a crash backoff, a restart between flushes) therefore cannot accrue
+  # toward the escape: a bare wall-clock reading of a marker written before such
+  # a gap would let the very first observation afterwards escape immediately,
+  # typing into a pane that may have just genuinely started a turn. It is
+  # created on the first such observation and removed the instant the streak
+  # breaks - on any composer read that is not exactly 'empty', on any non-busy verdict, and
   # once the escape has fired. It is deliberately NOT the escalation's own
   # undelivered age (state/.subsuper-escalations.since, which belongs to the
   # unrelated FM_MAX_DEFER_SECS mechanism): that age also accrues while
@@ -1288,7 +1307,8 @@ inject_msg() {  # <message> [state]
   # carry over from a prior session either.
   #
   # Fail-closed: if the marker cannot be created, is not a regular file, or
-  # cannot be stat'd, the streak age is 0 (keep deferring). An unreadable or
+  # cannot be stat'd, the streak age is 0 (keep deferring). The same holds for
+  # unreadable or corrupted contents. An unreadable or
   # absent marker must never read as infinitely old -
   # that would bypass the entire window on the first attempt, which is the
   # bound's whole purpose.
@@ -1300,15 +1320,37 @@ inject_msg() {  # <message> [state]
       log "inject deferred: supervisor pane busy (${PANE_BUSY_LAST_SOURCE:-agent mid-turn})"
       return 1
     fi
-    [ -f "$streak_marker" ] || { : > "$streak_marker"; } 2>/dev/null || true
     streak_age=0
     if [ -f "$streak_marker" ]; then
+      # Contents: seconds of disagreement observed so far. mtime: when the
+      # previous observation was made. This tick adds the time since that
+      # observation, capped at BUSY_EMPTY_STREAK_STEP_MAX, so a stretch the
+      # daemon never observed contributes at most a single poll interval.
+      streak_prev=
+      read -r streak_prev < "$streak_marker" 2>/dev/null || streak_prev=
+      case $streak_prev in ''|*[!0-9]*) streak_prev=0 ;; esac
+      # Strip leading zeros, then fail closed (0) on a value with more digits
+      # than the escape clamp could ever produce. inject_msg fires and removes
+      # the marker at BUSY_GUARD_ESCAPE_SECS_MAX at the latest, so anything
+      # longer is a corrupted marker - and comparing lengths, never the values,
+      # keeps a garbage value out of arithmetic that could overflow.
+      while [ "${#streak_prev}" -gt 1 ] && [ "${streak_prev#0}" != "$streak_prev" ]; do
+        streak_prev=${streak_prev#0}
+      done
+      [ "${#streak_prev}" -le "${#BUSY_GUARD_ESCAPE_SECS_MAX}" ] || streak_prev=0
+      streak_step=0
       streak_mtime=$(_stat_file_mtime "$streak_marker") || streak_mtime=
       if [ -n "$streak_mtime" ]; then
-        streak_age=$(( $(_now) - streak_mtime ))
-        [ "$streak_age" -ge 0 ] || streak_age=0
+        streak_step=$(( $(_now) - streak_mtime ))
+        [ "$streak_step" -ge 0 ] || streak_step=0
+        [ "$streak_step" -le "$BUSY_EMPTY_STREAK_STEP_MAX" ] || streak_step=$BUSY_EMPTY_STREAK_STEP_MAX
       fi
+      streak_age=$(( 10#$streak_prev + streak_step ))
     fi
+    # Rewriting the marker records this observation (contents) and its time
+    # (mtime) in one step; a first observation seeds it at 0.
+    { printf '%s\n' "$streak_age" > "$streak_marker"; } 2>/dev/null || true
+    [ -f "$streak_marker" ] || streak_age=0
     escape_secs=${BUSY_GUARD_ESCAPE_SECS_RESOLVED:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT}
     if [ "$escape_secs" -gt 0 ] && [ "$streak_age" -ge "$escape_secs" ]; then
       escape_fired=1

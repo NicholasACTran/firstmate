@@ -1902,6 +1902,16 @@ backdate_mtime() {  # <file> <secs-ago>
 
 STREAK_MARKER_NAME=.subsuper-busy-empty-streak-since
 
+# Seed the streak marker as the daemon itself writes it: contents = seconds of
+# busy-plus-empty disagreement observed so far, mtime = when that observation
+# was made. This file is the daemon's own persisted state contract, so a test
+# may compose it directly; `secs-since-observed` backdates the mtime to model a
+# gap in which the daemon never observed the pane.
+seed_streak() {  # <file> <observed-secs> [secs-since-observed]
+  printf '%s\n' "$2" > "$1"
+  [ "${3:-0}" -eq 0 ] || backdate_mtime "$1" "$3"
+}
+
 test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold() {
   local dir state
   dir=$(make_supercase inject-busy-empty-composer-early)
@@ -1964,8 +1974,7 @@ test_inject_msg_busy_guard_escapes_after_threshold() {
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
   _now > "$state/.subsuper-escalations.since"
-  : > "$state/$STREAK_MARKER_NAME"
-  backdate_mtime "$state/$STREAK_MARKER_NAME" 300
+  seed_streak "$state/$STREAK_MARKER_NAME" 300
   (
     LOG="$state/daemon.log"
     FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
@@ -1993,8 +2002,7 @@ test_inject_msg_busy_guard_escape_reads_composer_once() {
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
   _now > "$state/.subsuper-escalations.since"
-  : > "$state/$STREAK_MARKER_NAME"
-  backdate_mtime "$state/$STREAK_MARKER_NAME" 300
+  seed_streak "$state/$STREAK_MARKER_NAME" 300
   (
     FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
@@ -2017,8 +2025,7 @@ test_inject_msg_busy_guard_escape_one_second_short_still_defers() {
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
   _now > "$state/.subsuper-escalations.since"
-  : > "$state/$STREAK_MARKER_NAME"
-  backdate_mtime "$state/$STREAK_MARKER_NAME" 299
+  seed_streak "$state/$STREAK_MARKER_NAME" 299
   (
     FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
@@ -2040,8 +2047,7 @@ test_inject_msg_busy_guard_escape_disabled_by_zero() {
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
   _now > "$state/.subsuper-escalations.since"
-  : > "$state/$STREAK_MARKER_NAME"
-  backdate_mtime "$state/$STREAK_MARKER_NAME" 999999
+  seed_streak "$state/$STREAK_MARKER_NAME" 999999
   (
     FM_BUSY_GUARD_ESCAPE_SECS=0 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
@@ -2066,8 +2072,7 @@ test_inject_msg_busy_guard_streak_resets_when_composer_stops_reading_empty() {
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
   _now > "$state/.subsuper-escalations.since"
-  : > "$state/$STREAK_MARKER_NAME"
-  backdate_mtime "$state/$STREAK_MARKER_NAME" 299
+  seed_streak "$state/$STREAK_MARKER_NAME" 299
   (
     FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
@@ -2103,8 +2108,7 @@ test_inject_msg_busy_guard_streak_resets_when_pane_stops_reading_busy() {
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
   _now > "$state/.subsuper-escalations.since"
-  : > "$state/$STREAK_MARKER_NAME"
-  backdate_mtime "$state/$STREAK_MARKER_NAME" 299
+  seed_streak "$state/$STREAK_MARKER_NAME" 299
   (
     FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
@@ -2138,8 +2142,7 @@ test_inject_msg_busy_guard_streak_resets_on_unobserved_ticks() {
     mkdir -p "$state"
     printf 'digest item\n' > "$state/.subsuper-escalations"
     _now > "$state/.subsuper-escalations.since"
-    : > "$state/$STREAK_MARKER_NAME"
-    backdate_mtime "$state/$STREAK_MARKER_NAME" 299
+    seed_streak "$state/$STREAK_MARKER_NAME" 299
     (
       FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
       fm_backend_target_exists() { [ "$case_name" != target-gone ]; }
@@ -2172,6 +2175,68 @@ test_inject_msg_busy_guard_streak_resets_on_unobserved_ticks() {
     ) || fail "post-unobserved-gap subshell failed for case '$case_name'"
   done
   pass "inject_msg: an early return that never observes the pane breaks the busy+empty streak, so unobserved time cannot accrue toward the escape"
+}
+
+# Regression for streak-marker-ages-without-observations (PR #3090 round 7):
+# inject_msg only runs when the daemon reaches a delivery attempt, and the main
+# loop skips many ticks without ever looking at the pane (the pane-gone backoff,
+# the crash backoff, a restart between batch flushes). Reading the marker's
+# wall-clock age let all of that unobserved time count toward the escape, so the
+# first busy+empty observation after a threshold-length gap injected instantly -
+# into a pane that may have just genuinely started a turn. Each observation now
+# credits at most one poll interval, so an unobserved stretch cannot buy the
+# escape. Against the wall-clock version this test fails: it read age 3600 and
+# submitted.
+test_inject_msg_busy_guard_streak_ignores_unobserved_wall_clock() {
+  local dir state recorded
+  dir=$(make_supercase inject-busy-guard-streak-unobserved-wall-clock)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  _now > "$state/.subsuper-escalations.since"
+  # One observation an hour ago, and nothing observed since.
+  seed_streak "$state/$STREAK_MARKER_NAME" 0 3600
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "an hour the daemon never observed must not buy the escape"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg escaped the busy guard on unobserved wall-clock time"
+    fi
+  ) || fail "unobserved-wall-clock subshell failed"
+  recorded=$(cat "$state/$STREAK_MARKER_NAME" 2>/dev/null)
+  [ "${recorded:-0}" -le "$BUSY_EMPTY_STREAK_STEP_MAX" ] \
+    || fail "the observation credited ${recorded}s, more than the ${BUSY_EMPTY_STREAK_STEP_MAX}s poll interval it can account for"
+  pass "inject_msg: time in which the daemon never observed the pane does not accrue toward the busy-guard escape"
+}
+
+# The counterpart: genuinely continuous observation still reaches the threshold.
+# Capping each credit must slow the escape down, never disable it.
+test_inject_msg_busy_guard_streak_credits_observed_intervals() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-streak-observed-interval)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  _now > "$state/.subsuper-escalations.since"
+  # 290s already observed, and the previous observation was one poll interval
+  # ago - so this tick crosses the 300s threshold.
+  seed_streak "$state/$STREAK_MARKER_NAME" 290 "$BUSY_EMPTY_STREAK_STEP_MAX"
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
+      || fail "a continuously observed streak should still escape once it crosses the threshold"
+  ) || fail "observed-interval subshell failed"
+  assert_absent "$state/$STREAK_MARKER_NAME" "a fired escape should clear the streak marker"
+  pass "inject_msg: a continuously observed busy+empty streak still escapes once the observed seconds cross the threshold"
 }
 
 # Fail-closed: a marker that cannot be created or stat'd must read as age 0
@@ -2563,6 +2628,8 @@ test_inject_msg_busy_guard_escape_disabled_by_zero
 test_inject_msg_busy_guard_streak_resets_when_composer_stops_reading_empty
 test_inject_msg_busy_guard_streak_resets_when_pane_stops_reading_busy
 test_inject_msg_busy_guard_streak_resets_on_unobserved_ticks
+test_inject_msg_busy_guard_streak_ignores_unobserved_wall_clock
+test_inject_msg_busy_guard_streak_credits_observed_intervals
 test_inject_msg_busy_guard_streak_marker_uncreatable_fails_closed
 test_inject_msg_busy_guard_restart_does_not_reset_deadline
 test_resolve_busy_guard_escape_secs_valid_and_leading_zero_values
