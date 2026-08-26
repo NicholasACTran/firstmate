@@ -1,0 +1,59 @@
+==============================================================
+== RUN 1 - escape bound ENABLED (10s): stale busy footer must not silence away mode  (FM_BUSY_GUARD_ESCAPE_SECS=10)
+==============================================================
+--- supervisor pane as the operator would see it -------------
+✻ Thinking… (901s · esc to interrupt)
+❯ ⁣FIRSTMATE_OP: v1 away-supervisor: Supervisor escalate (       1 event(s)): fake-c1.status: done: PR https://example.test/pr/4210 (catch-all scan) (pre-read; re-arm not needed — watcher daemon-manage
+✻ Thinking… (901s · esc to interrupt)
+❯
+--- state/.supervise-daemon.log (inject lines) ---------------
+  [2026-08-26T03:52:11-0400] daemon starting (pid 21430); target=%0; target_source=FM_SUPERVISOR_TARGET; backend=tmux; backend_source=FM_SUPERVISOR_BACKEND; afk=on; inject_skip='heartbeat'; stale_escalate=999999s; batch=0s; busy_guard_escape=10s
+  [2026-08-26T03:52:14-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 0s straight, escapes at 10s
+  [2026-08-26T03:52:15-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 1s straight, escapes at 10s
+  [2026-08-26T03:52:17-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 3s straight, escapes at 10s
+  [2026-08-26T03:52:18-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 4s straight, escapes at 10s
+  [2026-08-26T03:52:19-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 5s straight, escapes at 10s
+  [2026-08-26T03:52:21-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 7s straight, escapes at 10s
+  [2026-08-26T03:52:22-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 8s straight, escapes at 10s
+  [2026-08-26T03:52:23-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 9s straight, escapes at 10s
+  [2026-08-26T03:52:24-0400] inject busy-guard override: rendered-pane busy-regex fallback has read busy against a confirmed-empty composer for 10s straight; delivering instead of deferring further
+  [2026-08-26T03:52:25-0400] inject delivered: escalation submitted (verdict=empty)
+--- what actually landed in the supervisor pane --------------
+  injection	⁣FIRSTMATE_OP: v1 away-supervisor: Supervisor escalate (       1 event(s)): fake-c1.status: done: PR https://example.test/pr/4210 (catch-all scan) (pre-read; re-arm not needed — watcher daemon-managed)
+--- state/.subsuper-last-delivery ----------------------------
+  epoch=1787730745 (Wed Aug 26 03:52:25 EDT 2026)
+
+==============================================================
+== RUN 2 - escape DISABLED (0 = pre-fix behavior): busy guard defers forever  (FM_BUSY_GUARD_ESCAPE_SECS=0)
+==============================================================
+--- supervisor pane as the operator would see it -------------
+✻ Thinking… (901s · esc to interrupt)
+❯
+--- state/.supervise-daemon.log (inject lines) ---------------
+  [2026-08-26T03:52:31-0400] daemon starting (pid 25835); target=%0; target_source=FM_SUPERVISOR_TARGET; backend=tmux; backend_source=FM_SUPERVISOR_BACKEND; afk=on; inject_skip='heartbeat'; stale_escalate=999999s; batch=0s; busy_guard_escape=0s
+  [2026-08-26T03:52:32-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 0s straight, escapes at 0s
+  [2026-08-26T03:52:34-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 2s straight, escapes at 0s
+  [2026-08-26T03:52:35-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 3s straight, escapes at 0s
+  [2026-08-26T03:52:37-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 5s straight, escapes at 0s
+  [2026-08-26T03:52:38-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 6s straight, escapes at 0s
+  [2026-08-26T03:52:39-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 7s straight, escapes at 0s
+  [2026-08-26T03:52:41-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 9s straight, escapes at 0s
+  [2026-08-26T03:52:42-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 10s straight, escapes at 0s
+  [2026-08-26T03:52:43-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 11s straight, escapes at 0s
+  [2026-08-26T03:52:45-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 13s straight, escapes at 0s
+  [2026-08-26T03:52:46-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 14s straight, escapes at 0s
+  [2026-08-26T03:52:47-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 15s straight, escapes at 0s
+  [2026-08-26T03:52:49-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 17s straight, escapes at 0s
+  [2026-08-26T03:52:50-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 18s straight, escapes at 0s
+  [2026-08-26T03:52:51-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 19s straight, escapes at 0s
+  [2026-08-26T03:52:52-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 20s straight, escapes at 0s
+  [2026-08-26T03:52:54-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 22s straight, escapes at 0s
+  [2026-08-26T03:52:55-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 23s straight, escapes at 0s
+  [2026-08-26T03:52:56-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 24s straight, escapes at 0s
+  [2026-08-26T03:52:58-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 26s straight, escapes at 0s
+  [2026-08-26T03:52:59-0400] inject deferred: supervisor pane busy (rendered-pane busy-regex fallback); composer confirmed-empty for 27s straight, escapes at 0s
+--- what actually landed in the supervisor pane --------------
+  (no escalation submitted - away mode silent)
+--- state/.subsuper-last-delivery ----------------------------
+  (absent - no delivery ever succeeded this session)
+
