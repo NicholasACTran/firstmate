@@ -683,18 +683,19 @@ unit_start_refuses_self_injecting_claude_on_herdr() {
   esac
   rm -rf "$st"
 
-  # (6) neither side resolvable -> permitted, but the guard says out loud that
-  # it could not check itself rather than permitting silently.
+  # (6) herdr provably absent (no TMUX_PANE, no HERDR_ENV+HERDR_PANE_ID) is not
+  # ambiguity - there is nothing the guard could have failed to check, so it
+  # permits SILENTLY rather than crying wolf on every plain claude terminal.
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-start-guard.XXXXXX")
   mkdir -p "$st/state"
   out=$(start_guard_run "$st" CLAUDECODE=1)
   case "$out" in
-    *'starting supervise daemon'*) pass "start guard: an unresolvable pane permits rather than blocks" ;;
-    *) fail "start guard: an unresolvable pane was refused ($out)" ;;
+    *'starting supervise daemon'*) pass "start guard: herdr provably absent permits rather than blocks" ;;
+    *) fail "start guard: herdr provably absent was refused ($out)" ;;
   esac
   case "$out" in
-    *"cannot resolve this process's own pane"*) pass "start guard: unresolvable state emits the could-not-check diagnostic" ;;
-    *) fail "start guard: unresolvable state permitted silently ($out)" ;;
+    *"cannot resolve"*) fail "start guard: herdr provably absent still emitted the could-not-check diagnostic ($out)" ;;
+    *) pass "start guard: herdr provably absent permits without the could-not-check diagnostic" ;;
   esac
   rm -rf "$st"
 }

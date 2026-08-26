@@ -107,22 +107,22 @@ fm_afk_start_native_refused() {
   harness=$("$FM_AFK_START_DIR/fm-harness.sh" 2>/dev/null) || harness=unknown
   [ "$harness" = claude ] || return 1
 
-  own_backend=$(fm_afk_start_own_backend) || own_backend=''
-  own_pane=$(fm_afk_start_own_pane) || own_pane=''
-  # Deliberate: an unresolvable side means the guard cannot check itself, so it
-  # permits rather than blocks on unknown state, and says so out loud instead of
-  # permitting silently.
-  if [ -z "$own_backend" ] || [ -z "$own_pane" ]; then
-    echo "afk: cannot resolve this process's own pane (no TMUX_PANE, no HERDR_ENV+HERDR_PANE_ID), so the claude+herdr self-injection guard cannot check itself; permitting this start rather than blocking on unknown state" >&2
-    return 1
-  fi
+  # Resolve backend FIRST and narrow the "cannot check myself" diagnostic to
+  # when it is actually true: herdr provably absent (no TMUX_PANE, no
+  # HERDR_ENV+HERDR_PANE_ID) or resolved to a different backend is not
+  # ambiguity, it is proof there is nothing to warn about - permit silently.
+  own_backend=$(fm_afk_start_own_backend) || return 1
   [ "$own_backend" = herdr ] || return 1
 
-  target=$(discover_supervisor_target) || target=''
-  if [ -z "$target" ]; then
+  own_pane=$(fm_afk_start_own_pane) || {
+    echo "afk: resolved this process's own backend as herdr but could not resolve its own pane, so the claude+herdr self-injection guard cannot check itself; permitting this start rather than blocking on unknown state" >&2
+    return 1
+  }
+
+  target=$(discover_supervisor_target) || {
     echo "afk: cannot resolve the escalation injection target, so the claude+herdr self-injection guard cannot check itself; permitting this start rather than blocking on unknown state" >&2
     return 1
-  fi
+  }
 
   [ "$own_pane" = "$target" ] || return 1
   return 0
@@ -212,6 +212,17 @@ fm_afk_flag_write() {  # <state-dir>
   return 1
 }
 
+# Write (or verify) the lifecycle flag on the path that has decided to proceed.
+# Shared by the refresh and fresh branches of fm_afk_start_main so neither
+# writes it before that decision is made.
+fm_afk_start_ensure_flag() {
+  if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
+    [ -f "$FM_AFK_STATE/.afk" ] || { echo "afk: launcher-prepared state is missing" >&2; return 1; }
+  else
+    fm_afk_flag_write "$FM_AFK_STATE" || { echo "afk: failed to write away-mode flag" >&2; return 1; }
+  fi
+}
+
 fm_afk_start_main() {
   case "${1:-}" in
     '' ) ;;
@@ -219,35 +230,26 @@ fm_afk_start_main() {
     * ) echo "usage: $(basename "${BASH_SOURCE[1]:-fm-afk-start.sh}")" >&2; return 2 ;;
   esac
 
-  local had_flag=0
-  [ ! -e "$FM_AFK_STATE/.afk" ] || had_flag=1
-
   mkdir -p "$FM_AFK_STATE"
-  if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
-    [ -f "$FM_AFK_STATE/.afk" ] || { echo "afk: launcher-prepared state is missing" >&2; return 1; }
-  else
-    fm_afk_flag_write "$FM_AFK_STATE" || { echo "afk: failed to write away-mode flag" >&2; return 1; }
-  fi
 
   local pid
   pid=$(daemon_lock_pid 2>/dev/null || true)
   if daemon_lock_held_by_live_daemon; then
+    fm_afk_start_ensure_flag || return 1
     echo "afk: daemon already running pid=$pid"
     return 0
   fi
 
-  # Only a genuine FRESH start reaches the guard: a refresh of an already-live,
-  # already-safely-hosted daemon returned above untouched. Roll the away flag
-  # back when this invocation is the one that wrote it, so a refusal leaves the
-  # lifecycle exactly as it found it.
+  # Only a genuine FRESH start reaches here (a refresh of an already-live,
+  # already-safely-hosted daemon returned above, untouched). Decide BEFORE
+  # writing any lifecycle state, so a refusal leaves nothing to roll back.
   if fm_afk_start_native_refused; then
-    if [ "${FM_AFK_STATE_PREPARED:-0}" != 1 ] && [ "$had_flag" -eq 0 ]; then
-      rm -f "$FM_AFK_STATE/.afk" 2>/dev/null || true
-    fi
     echo "afk: refusing to host the away daemon in the same pane it injects into on claude+herdr: a claude background shell renders in that pane's footer, herdr reads that as the agent working, so the away daemon defers forever and away mode silently delivers nothing" >&2
     echo "afk: use 'bin/fm-afk-launch.sh start' instead (non-visible daemon terminal)" >&2
     return 1
   fi
+
+  fm_afk_start_ensure_flag || return 1
 
   if fm_pid_alive "$pid" && [ -n "$pid" ]; then
     fm_lock_remove_path "$FM_AFK_LOCK" 2>/dev/null || true
