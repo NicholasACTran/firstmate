@@ -47,9 +47,33 @@ FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$FM_AFK_START_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-supervisor-target-lib.sh
+. "$FM_AFK_START_DIR/fm-supervisor-target-lib.sh"
 
 fm_afk_start_usage() {
   sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+# The claude+herdr exception, enforced here too: bin/fm-afk-launch.sh's own
+# start-native guard only covers entry THROUGH the launcher. This script is
+# also a documented direct entry point (the second half of the native two-step,
+# and a bare direct call), so the same wedge is reachable by skipping the
+# launcher entirely. Key the refusal on HOSTING MODE, not on harness+backend
+# alone: the launcher's own terminal-backed path also execs this script, but
+# does so in its OWN separate pane and always passes FM_SUPERVISOR_TARGET
+# explicitly so the daemon injects into the captain pane rather than
+# discovering its own - that explicit target is what marks a launcher-hosted,
+# already-safe invocation. Its absence means this process will auto-discover
+# ITS OWN pane as the target, i.e. it IS the pane being hosted in - the exact
+# in-pane case that wedges herdr's claude detection.
+fm_afk_start_native_refused() {
+  local harness backend
+  [ -z "${FM_SUPERVISOR_TARGET:-}" ] || return 1
+  backend=$(discover_supervisor_backend) || true
+  [ "$backend" = herdr ] || return 1
+  harness=$("$FM_AFK_START_DIR/fm-harness.sh" 2>/dev/null) || harness=unknown
+  [ "$harness" = claude ] || return 1
+  return 0
 }
 
 # fm_afk_clear_stale_artifacts: on a FRESH away-session entry (the daemon is not
@@ -142,6 +166,14 @@ fm_afk_start_main() {
     -h|--help) fm_afk_start_usage; return 0 ;;
     * ) echo "usage: $(basename "${BASH_SOURCE[1]:-fm-afk-start.sh}")" >&2; return 2 ;;
   esac
+
+  # Refuse BEFORE touching lifecycle state (before mkdir/flag-write), so a
+  # refusal leaves nothing to roll back.
+  if fm_afk_start_native_refused; then
+    echo "afk: refusing to host the away daemon in this pane on claude+herdr: a claude background shell renders in the captain pane's footer, herdr reads that as the agent working, so the away daemon defers forever and away mode silently delivers nothing" >&2
+    echo "afk: use 'bin/fm-afk-launch.sh start' instead (non-visible daemon terminal)" >&2
+    return 1
+  fi
 
   mkdir -p "$FM_AFK_STATE"
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
