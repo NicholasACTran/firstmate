@@ -2013,7 +2013,22 @@ test_resolve_busy_guard_escape_secs_clamp_boundary() {
     assert_grep "exceeds the ${BUSY_GUARD_ESCAPE_SECS_MAX}s clamp" "$LOG" \
       "exceeding the clamp should be refused loudly: $(cat "$LOG" 2>/dev/null)"
   ) || fail "over-clamp subshell failed"
-  pass "resolve_busy_guard_escape_secs: a value at the clamp is accepted, one past it falls back to the default with a loud log line"
+  # Review fix (round 5): a digit-only value FAR outside bash's signed integer
+  # range must not be handed to `$(( ))` before the clamp check - overflow
+  # there silently wraps, which could land back in-range and defeat the
+  # clamp entirely. Assert the resolved value is exactly the default, not
+  # merely "not equal to the huge input" (a wrapped garbage value would also
+  # differ from the input, so that weaker assertion could pass on the bug).
+  (
+    LOG="$TMP_ROOT/clamp-overflow.log"
+    FM_BUSY_GUARD_ESCAPE_SECS="99999999999999999999999999999999999999"
+    resolve_busy_guard_escape_secs
+    [ "$BUSY_GUARD_ESCAPE_SECS_RESOLVED" = "$BUSY_GUARD_ESCAPE_SECS_DEFAULT" ] \
+      || fail "a value far outside bash's integer range should fall back to the default via safe string comparison, got '$BUSY_GUARD_ESCAPE_SECS_RESOLVED' (a wrapped/garbage value would indicate the clamp ran AFTER an overflowing arithmetic conversion)"
+    assert_grep "exceeds the ${BUSY_GUARD_ESCAPE_SECS_MAX}s clamp" "$LOG" \
+      "an overflow-sized value should be refused loudly: $(cat "$LOG" 2>/dev/null)"
+  ) || fail "overflow-sized value subshell failed"
+  pass "resolve_busy_guard_escape_secs: a value at the clamp is accepted, one past it falls back to the default, and a value far outside bash's integer range is rejected by safe string comparison rather than overflowing arithmetic"
 }
 
 test_resolve_busy_guard_escape_secs_invalid_falls_back_and_logs() {

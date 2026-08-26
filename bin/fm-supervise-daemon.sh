@@ -1155,23 +1155,39 @@ window_for_task() {  # <task-key> [state]
 # escape; a positive integer up to BUSY_GUARD_ESCAPE_SECS_MAX sets the
 # interval; anything else - blank, non-numeric, negative, or above the clamp -
 # is refused with one loud log line and the default applied, never a silent
-# permanent disable. A digit-only value is parsed with the base forced to 10
-# (`10#`), so a leading-zero literal like 010 reads as decimal ten - never as
-# bash arithmetic's C-style octal (which would silently read 010 as eight and
-# outright error on 008/009). Called once by fm_super_main at daemon start;
-# tests call it directly to set up the resolved value before exercising
-# inject_msg.
+# permanent disable. Called once by fm_super_main at daemon start; tests call
+# it directly to set up the resolved value before exercising inject_msg.
+#
+# Leading zeros are stripped with a pure string match BEFORE any arithmetic
+# touches the value, and the clamp is enforced by comparing digit COUNT (and,
+# only on a tie, a lexicographic compare of same-length decimal digit
+# strings) rather than by converting to a number first. Both of those are
+# deliberate: `$((10#$raw))` on an absurdly long digit-only operator value
+# would overflow bash's signed arithmetic and silently WRAP to some other
+# in-range value - checking the clamp on that wrapped result would be too
+# late, since the wrap could land back inside range. String comparison never
+# has that failure mode because it never evaluates the value as a number.
 resolve_busy_guard_escape_secs() {
-  local raw=${FM_BUSY_GUARD_ESCAPE_SECS:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT} val
+  local raw=${FM_BUSY_GUARD_ESCAPE_SECS:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT} stripped max_digits val
   case "$raw" in
     ''|*[!0-9]*)
       log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='${raw}' is not zero or a positive integer; refusing it and using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
       val=$BUSY_GUARD_ESCAPE_SECS_DEFAULT ;;
     *)
-      val=$((10#$raw))
-      if [ "$val" -gt "$BUSY_GUARD_ESCAPE_SECS_MAX" ]; then
-        log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS=${val} exceeds the ${BUSY_GUARD_ESCAPE_SECS_MAX}s clamp; using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
+      stripped=""
+      [[ "$raw" =~ ^0*([0-9]*)$ ]] && stripped=${BASH_REMATCH[1]}
+      [ -n "$stripped" ] || stripped=0
+      max_digits=${#BUSY_GUARD_ESCAPE_SECS_MAX}
+      # shellcheck disable=SC2071 # deliberate STRING compare: both operands
+      # are same-length, leading-zero-free digit strings, so lexicographic
+      # order equals numeric order - the point is comparing without ever
+      # converting either side to a number.
+      if [ "${#stripped}" -gt "$max_digits" ] \
+         || { [ "${#stripped}" -eq "$max_digits" ] && [[ "$stripped" > "$BUSY_GUARD_ESCAPE_SECS_MAX" ]]; }; then
+        log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='${raw}' exceeds the ${BUSY_GUARD_ESCAPE_SECS_MAX}s clamp; using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
         val=$BUSY_GUARD_ESCAPE_SECS_DEFAULT
+      else
+        val=$stripped
       fi
       ;;
   esac
