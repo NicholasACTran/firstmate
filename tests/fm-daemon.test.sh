@@ -2243,6 +2243,69 @@ test_inject_msg_busy_guard_streak_credits_observed_intervals() {
 # (keep deferring), never as _file_age's "missing = 999999" sentinel. Treating
 # an unknown age as maximally old would bypass the entire window on the very
 # first attempt - exactly the unbounded behavior this bound exists to end.
+# Regression for escape-window-stretches (PR #3090 round 8): each observed
+# busy+empty tick credits at most ONE POLL INTERVAL, and the poll interval is
+# the effective FM_HOUSEKEEPING_TICK - not a hard-coded 15s. Pinning the credit
+# to the default multiplied the configured escape window by tick/15 on any
+# slower cadence: a 60s housekeeping tick turned the documented 300s bound into
+# ~1200s of away-mode silence. Against that version this test fails - it
+# credits 15s instead of 60s, lands on 255s, and defers.
+test_inject_msg_busy_guard_streak_credits_the_configured_poll_interval() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-streak-slow-tick)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  _now > "$state/.subsuper-escalations.since"
+  # 240s already observed, and the previous observation was one 60s poll
+  # interval ago - so this tick lands exactly on the 300s threshold.
+  seed_streak "$state/$STREAK_MARKER_NAME" 240 60
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    FM_HOUSEKEEPING_TICK=60 resolve_busy_empty_streak_step_max
+    [ "$BUSY_EMPTY_STREAK_STEP_MAX" -eq 60 ] \
+      || fail "a 60s housekeeping tick should credit up to 60s per observation, got $BUSY_EMPTY_STREAK_STEP_MAX"
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
+      || fail "a continuously observed streak on a 60s cadence should escape at the configured 300s, not at 300s x (60/15)"
+  ) || fail "slow-tick credit subshell failed"
+  assert_absent "$state/$STREAK_MARKER_NAME" "a fired escape should clear the streak marker"
+  pass "inject_msg: each observation credits the configured FM_HOUSEKEEPING_TICK, so a slow cadence does not stretch the escape window"
+}
+
+# The step cap describes a real poll interval. A zero cadence would credit 0s
+# per observation (an escape that never fires); a non-numeric, negative, or
+# absurd one describes nothing at all. All fall back to the default rather than
+# silently disabling or blowing open the bound.
+test_resolve_busy_empty_streak_step_max_invalid_falls_back_to_default() {
+  local raw
+  for raw in 0 not-a-number -5 99999999999999999999999999999999999999; do
+    (
+      LOG="$TMP_ROOT/step-max-${raw//[^A-Za-z0-9]/_}.log"
+      FM_HOUSEKEEPING_TICK="$raw"
+      resolve_busy_empty_streak_step_max
+      [ "$BUSY_EMPTY_STREAK_STEP_MAX" = "$HOUSEKEEPING_TICK_DEFAULT" ] \
+        || fail "FM_HOUSEKEEPING_TICK='$raw' should credit the default ($HOUSEKEEPING_TICK_DEFAULT), got '$BUSY_EMPTY_STREAK_STEP_MAX'"
+      assert_grep "is not a positive integer poll interval" "$LOG" \
+        "an unusable cadence ('$raw') should be refused loudly: $(cat "$LOG" 2>/dev/null)"
+    ) || fail "step-max invalid-value subshell failed for raw='$raw'"
+  done
+  # And a leading-zero cadence is decimal, never octal: 010 credits ten
+  # seconds per observation, not eight.
+  (
+    LOG="$TMP_ROOT/step-max-010.log"
+    FM_HOUSEKEEPING_TICK=010
+    resolve_busy_empty_streak_step_max
+    [ "$BUSY_EMPTY_STREAK_STEP_MAX" = 10 ] \
+      || fail "FM_HOUSEKEEPING_TICK=010 should resolve to 10, got '$BUSY_EMPTY_STREAK_STEP_MAX'"
+  ) || fail "step-max leading-zero subshell failed"
+  pass "resolve_busy_empty_streak_step_max: zero, non-numeric, negative, and overflow-sized cadences fall back to the default; leading zeros parse as decimal"
+}
+
 test_inject_msg_busy_guard_streak_marker_uncreatable_fails_closed() {
   local dir state
   dir=$(make_supercase inject-busy-guard-streak-unwritable)
@@ -2630,6 +2693,8 @@ test_inject_msg_busy_guard_streak_resets_when_pane_stops_reading_busy
 test_inject_msg_busy_guard_streak_resets_on_unobserved_ticks
 test_inject_msg_busy_guard_streak_ignores_unobserved_wall_clock
 test_inject_msg_busy_guard_streak_credits_observed_intervals
+test_inject_msg_busy_guard_streak_credits_the_configured_poll_interval
+test_resolve_busy_empty_streak_step_max_invalid_falls_back_to_default
 test_inject_msg_busy_guard_streak_marker_uncreatable_fails_closed
 test_inject_msg_busy_guard_restart_does_not_reset_deadline
 test_resolve_busy_guard_escape_secs_valid_and_leading_zero_values

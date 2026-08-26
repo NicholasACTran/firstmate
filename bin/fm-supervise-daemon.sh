@@ -104,7 +104,11 @@
 #          FM_HEARTBEAT_SCAN_SECS   cadence for the catch-all status scan
 #                                   (default 300)
 #          FM_HOUSEKEEPING_TICK     seconds between housekeeping passes while
-#                                   the watcher is mid-cycle (default 15)
+#                                   the watcher is mid-cycle (default 15); also
+#                                   the per-observation credit cap for the
+#                                   FM_BUSY_GUARD_ESCAPE_SECS window below,
+#                                   since it is the cadence at which a buffered
+#                                   escalation is actually retried
 #          FM_BUSY_REGEX            optional rendered busy-signature override
 #                                   for delivery guards and Grok's fallback
 #          FM_COMPOSER_IDLE_RE      optional shared classifier override; see
@@ -233,10 +237,14 @@ BUSY_GUARD_ESCAPE_SECS_MAX=86400
 # attempt: the main loop can skip many ticks (pane gone, crash backoff, a
 # restart between flushes) without observing the pane at all, and that
 # unobserved wall-clock must not accrue toward the escape. Each observation
-# therefore contributes at most one poll interval - HOUSEKEEPING_TICK_DEFAULT,
-# the cadence at which a buffered escalation is retried - so the escape still
-# needs a genuinely continuous run of observations no matter how long the gaps
-# between them were.
+# therefore contributes at most one poll interval - the housekeeping cadence at
+# which a buffered escalation is actually retried - so the escape still needs a
+# genuinely continuous run of observations no matter how long the gaps between
+# them were. Seeded with the default cadence and resolved once at daemon start
+# by resolve_busy_empty_streak_step_max from the EFFECTIVE FM_HOUSEKEEPING_TICK:
+# pinning it to the default would credit at most 15s per retry on a slower
+# cadence, stretching a 300s escape to 20 minutes of away-mode silence on a 60s
+# tick and defeating the bound this whole mechanism exists to provide.
 BUSY_EMPTY_STREAK_STEP_MAX=$HOUSEKEEPING_TICK_DEFAULT
 # Resolved once at daemon start by resolve_busy_guard_escape_secs (below);
 # empty until then, in which case inject_msg falls back to the default.
@@ -1156,6 +1164,39 @@ window_for_task() {  # <task-key> [state]
   return 1
 }
 
+# _resolve_secs_override <raw> <max>: shared, overflow-safe validation for this
+# daemon's integer-seconds overrides. On success prints <raw> as a
+# leading-zero-free decimal string and returns 0; returns 1 for a blank,
+# non-numeric, or negative value and 2 for a value above <max>, printing
+# nothing, so each caller logs its refusal in its own words.
+#
+# Leading zeros are stripped with a pure string match BEFORE any arithmetic
+# touches the value (so `010` is ten seconds, not bash-octal eight), and the
+# clamp is enforced by comparing digit COUNT (and, only on a tie, a
+# lexicographic compare of same-length decimal digit strings) rather than by
+# converting to a number first. Both are deliberate: `$((10#$raw))` on an
+# absurdly long digit-only operator value would overflow bash's signed
+# arithmetic and silently WRAP to some other in-range value - checking the
+# clamp on that wrapped result would be too late, since the wrap could land
+# back inside range. String comparison never has that failure mode because it
+# never evaluates the value as a number.
+_resolve_secs_override() {  # <raw> <max>
+  local raw=$1 max=$2 stripped max_digits
+  case "$raw" in ''|*[!0-9]*) return 1 ;; esac
+  stripped=""
+  [[ "$raw" =~ ^0*([0-9]*)$ ]] && stripped=${BASH_REMATCH[1]}
+  [ -n "$stripped" ] || stripped=0
+  max_digits=${#max}
+  # shellcheck disable=SC2071 # deliberate STRING compare: both operands are
+  # same-length, leading-zero-free digit strings, so lexicographic order equals
+  # numeric order - the point is comparing without ever converting to a number.
+  if [ "${#stripped}" -gt "$max_digits" ] \
+     || { [ "${#stripped}" -eq "$max_digits" ] && [[ "$stripped" > "$max" ]]; }; then
+    return 2
+  fi
+  printf '%s' "$stripped"
+}
+
 # resolve_busy_guard_escape_secs: resolve FM_BUSY_GUARD_ESCAPE_SECS into
 # BUSY_GUARD_ESCAPE_SECS_RESOLVED exactly once, rather than re-parsing and
 # re-validating it on every busy-guard attempt. 0 (and only 0) disables the
@@ -1163,42 +1204,42 @@ window_for_task() {  # <task-key> [state]
 # interval; anything else - blank, non-numeric, negative, or above the clamp -
 # is refused with one loud log line and the default applied, never a silent
 # permanent disable. Called once by fm_super_main at daemon start; tests call
-# it directly to set up the resolved value before exercising inject_msg.
-#
-# Leading zeros are stripped with a pure string match BEFORE any arithmetic
-# touches the value, and the clamp is enforced by comparing digit COUNT (and,
-# only on a tie, a lexicographic compare of same-length decimal digit
-# strings) rather than by converting to a number first. Both of those are
-# deliberate: `$((10#$raw))` on an absurdly long digit-only operator value
-# would overflow bash's signed arithmetic and silently WRAP to some other
-# in-range value - checking the clamp on that wrapped result would be too
-# late, since the wrap could land back inside range. String comparison never
-# has that failure mode because it never evaluates the value as a number.
+# it directly to set up the resolved value before exercising inject_msg. The
+# leading-zero and overflow-safe clamp handling lives in _resolve_secs_override
+# above.
 resolve_busy_guard_escape_secs() {
-  local raw=${FM_BUSY_GUARD_ESCAPE_SECS:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT} stripped max_digits val
-  case "$raw" in
-    ''|*[!0-9]*)
+  local raw=${FM_BUSY_GUARD_ESCAPE_SECS:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT} val rc
+  val=$(_resolve_secs_override "$raw" "$BUSY_GUARD_ESCAPE_SECS_MAX") && rc=0 || rc=$?
+  case $rc in
+    1)
       log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='${raw}' is not zero or a positive integer; refusing it and using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
       val=$BUSY_GUARD_ESCAPE_SECS_DEFAULT ;;
-    *)
-      stripped=""
-      [[ "$raw" =~ ^0*([0-9]*)$ ]] && stripped=${BASH_REMATCH[1]}
-      [ -n "$stripped" ] || stripped=0
-      max_digits=${#BUSY_GUARD_ESCAPE_SECS_MAX}
-      # shellcheck disable=SC2071 # deliberate STRING compare: both operands
-      # are same-length, leading-zero-free digit strings, so lexicographic
-      # order equals numeric order - the point is comparing without ever
-      # converting either side to a number.
-      if [ "${#stripped}" -gt "$max_digits" ] \
-         || { [ "${#stripped}" -eq "$max_digits" ] && [[ "$stripped" > "$BUSY_GUARD_ESCAPE_SECS_MAX" ]]; }; then
-        log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='${raw}' exceeds the ${BUSY_GUARD_ESCAPE_SECS_MAX}s clamp; using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
-        val=$BUSY_GUARD_ESCAPE_SECS_DEFAULT
-      else
-        val=$stripped
-      fi
-      ;;
+    2)
+      log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='${raw}' exceeds the ${BUSY_GUARD_ESCAPE_SECS_MAX}s clamp; using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
+      val=$BUSY_GUARD_ESCAPE_SECS_DEFAULT ;;
   esac
   BUSY_GUARD_ESCAPE_SECS_RESOLVED=$val
+}
+
+# resolve_busy_empty_streak_step_max: resolve BUSY_EMPTY_STREAK_STEP_MAX from
+# the EFFECTIVE housekeeping cadence, once, at daemon start. Each observed
+# busy-plus-empty tick credits at most one poll interval toward the escape, and
+# that interval is FM_HOUSEKEEPING_TICK - the cadence at which the main loop
+# actually retries a buffered escalation. Crediting a fixed 15s regardless
+# would multiply the configured escape window by tick/15 on any slower cadence
+# (a 60s tick turns a 300s bound into ~1200s of silence), which is exactly the
+# unbounded-silence failure this mechanism exists to cap. A zero, negative,
+# non-numeric, or absurdly large cadence cannot describe a real poll interval,
+# so the step cap falls back to the default rather than crediting 0s per
+# observation (an escape that never fires) or a whole day at once.
+resolve_busy_empty_streak_step_max() {
+  local raw=${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT} val rc
+  val=$(_resolve_secs_override "$raw" "$BUSY_GUARD_ESCAPE_SECS_MAX") && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ] || [ "$val" -eq 0 ]; then
+    log "inject busy-guard escape: FM_HOUSEKEEPING_TICK='${raw}' is not a positive integer poll interval; crediting at most the default (${HOUSEKEEPING_TICK_DEFAULT}s) per observed busy+empty tick"
+    val=$HOUSEKEEPING_TICK_DEFAULT
+  fi
+  BUSY_EMPTY_STREAK_STEP_MAX=$val
 }
 
 # --- injection --------------------------------------------------------------
@@ -1680,6 +1721,7 @@ fm_super_main() {
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
   resolve_busy_guard_escape_secs
+  resolve_busy_empty_streak_step_max
   log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s; busy_guard_escape=${BUSY_GUARD_ESCAPE_SECS_RESOLVED}s"
   migrate_watcher_pause_markers "$STATE"
 
