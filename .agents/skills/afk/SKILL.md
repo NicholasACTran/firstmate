@@ -30,6 +30,7 @@ batched digest rather than per-wake injections.
      A Claude Code background shell hosting the daemon in the captain's own pane leaves a `· 1 shell ·` token in that pane's rendered footer for as long as the daemon lives.
      Herdr's own claude agent-detection ruleset maps that exact token to `agent_status = "working"` at a priority that beats the idle rule, so the away-mode busy guard reads the captain's pane as permanently busy and can never deliver an escalation into it for the life of the session - proven in `data/firstmate-afk-daemon-wedged-investigation/report.md` (2026-08-26), which found this in every claude+herdr away run since 2026-08-19.
      Do not "fix" this by teaching the busy guard to subtract the daemon's own footer contribution; that couples firstmate to a private, versioned herdr ruleset that already changes without notice.
+     `bin/fm-afk-launch.sh start-native` enforces this rule itself: on claude+herdr it refuses before writing any lifecycle state, so a refusal there is the guard working and there is nothing to roll back - re-enter with `bin/fm-afk-launch.sh start`.
    - **Harness WITH a native in-pane tracked-background tool, on any OTHER combination** (e.g. claude's
      background bash on tmux, grok's background tool): first run
      `bin/fm-afk-launch.sh start-native`, then run
