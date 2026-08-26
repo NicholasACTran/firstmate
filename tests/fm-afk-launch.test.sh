@@ -488,7 +488,8 @@ unit_native_lifecycle() {
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native.XXXXXX")
   mkdir -p "$st/state"
   : > "$st/state/.subsuper-escalations"
-  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-native >/dev/null 2>&1 \
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_BACKEND=tmux \
+    "$LAUNCH" start-native >/dev/null 2>&1 \
     && [ "$(cut -f1 "$st/state/.afk-daemon-terminal")" = none ] \
     && [ -e "$st/state/.afk" ] \
     && [ ! -e "$st/state/.subsuper-escalations" ]; then
@@ -501,6 +502,58 @@ unit_native_lifecycle() {
     pass "native lifecycle: uniform stop clears state without closing a terminal"
   else
     fail "native lifecycle: uniform stop retained state"
+  fi
+  rm -rf "$st"
+}
+
+# Regression for the 95-minute wedged away session: claude hosting the daemon in
+# its own pane on herdr leaves a footer shell token that herdr reports as
+# "working", so the busy guard never sees the captain pane idle. The launcher
+# must refuse exactly that pair, write no lifecycle state when it does, and keep
+# permitting every neighbouring pair.
+unit_native_refuses_claude_on_herdr() {
+  local st out refused=0
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-guard.XXXXXX")
+  mkdir -p "$st/state"
+
+  out=$(env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u PI_CODING_AGENT -u GROK_AGENT \
+    CLAUDECODE=1 FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
+    FM_SUPERVISOR_TARGET=captain FM_SUPERVISOR_BACKEND=herdr \
+    "$LAUNCH" start-native 2>&1) || refused=1
+  if [ "$refused" -eq 1 ] && [ ! -e "$st/state/.afk" ] && [ ! -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "native guard: claude+herdr is refused with no lifecycle state written"
+  else
+    fail "native guard: claude+herdr native launch was accepted"
+  fi
+  case "$out" in
+    *'bin/fm-afk-launch.sh start'*) pass "native guard: refusal names the terminal-backed path" ;;
+    *) fail "native guard: refusal did not name the terminal-backed path" ;;
+  esac
+
+  rm -rf "$st"
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-guard.XXXXXX")
+  mkdir -p "$st/state"
+  if env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u PI_CODING_AGENT -u GROK_AGENT \
+    CLAUDECODE=1 FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
+    FM_SUPERVISOR_TARGET=captain FM_SUPERVISOR_BACKEND=tmux \
+    "$LAUNCH" start-native >/dev/null 2>&1 \
+    && [ "$(cut -f1 "$st/state/.afk-daemon-terminal")" = none ]; then
+    pass "native guard: claude on a non-herdr backend is still permitted"
+  else
+    fail "native guard: claude on a non-herdr backend was refused"
+  fi
+
+  rm -rf "$st"
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-guard.XXXXXX")
+  mkdir -p "$st/state"
+  if env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u CLAUDECODE -u GROK_AGENT \
+    PI_CODING_AGENT=true FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
+    FM_SUPERVISOR_TARGET=captain FM_SUPERVISOR_BACKEND=herdr \
+    "$LAUNCH" start-native >/dev/null 2>&1 \
+    && [ "$(cut -f1 "$st/state/.afk-daemon-terminal")" = none ]; then
+    pass "native guard: a non-claude harness on herdr is still permitted"
+  else
+    fail "native guard: a non-claude harness on herdr was refused"
   fi
   rm -rf "$st"
 }
@@ -759,7 +812,7 @@ unit_clear_failure_aborts_entry() {
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-clear-fail.XXXXXX")
   mkdir -p "$st/state"
   : > "$st/state/.subsuper-escalations"
-  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_BACKEND=tmux bash -c '
     . "$1"
     fm_afk_launch_reconcile() { return 0; }
     fm_afk_clear_stale_artifacts() { return 1; }
@@ -812,7 +865,7 @@ unit_flag_write_failure_aborts() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-flag-fail.XXXXXX")
   mkdir -p "$st/state"
-  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_BACKEND=tmux bash -c '
     . "$1"
     fm_afk_launch_flag_write() { return 1; }
     ! fm_afk_launch_start_native
@@ -940,6 +993,7 @@ unit_readiness_failure_rolls_back_terminal
 unit_readiness_failure_preserves_unconfirmed_record
 unit_tmux_absence_distinguishes_probe_failure
 unit_native_lifecycle
+unit_native_refuses_claude_on_herdr
 unit_native_entry_preserves_prepared_state
 unit_close_failure_preserves_record
 unit_record_publication_atomic
