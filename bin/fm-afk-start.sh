@@ -58,21 +58,73 @@ fm_afk_start_usage() {
 # start-native guard only covers entry THROUGH the launcher. This script is
 # also a documented direct entry point (the second half of the native two-step,
 # and a bare direct call), so the same wedge is reachable by skipping the
-# launcher entirely. Key the refusal on HOSTING MODE, not on harness+backend
-# alone: the launcher's own terminal-backed path also execs this script, but
-# does so in its OWN separate pane and always passes FM_SUPERVISOR_TARGET
-# explicitly so the daemon injects into the captain pane rather than
-# discovering its own - that explicit target is what marks a launcher-hosted,
-# already-safe invocation. Its absence means this process will auto-discover
-# ITS OWN pane as the target, i.e. it IS the pane being hosted in - the exact
-# in-pane case that wedges herdr's claude detection.
+# launcher entirely.
+#
+# The hazard is PHYSICAL: the daemon hosting itself in the very pane it will
+# inject escalations into (self-injection). On claude+herdr that pane's footer
+# then carries the background-shell token for the life of the session, herdr's
+# claude detection reads it as "the agent is working", and every escalation
+# defers forever. So the signal is a same-pane comparison, not the presence of
+# any environment knob: fm_afk_start_own_pane resolves where THIS process is
+# actually running (raw $TMUX_PANE / $HERDR_ENV+$HERDR_PANE_ID, deliberately
+# ignoring the FM_SUPERVISOR_TARGET override), while discover_supervisor_target
+# resolves where injection will actually land (override first, exactly as
+# inject_msg does). The launcher's terminal-backed path stays permitted because
+# it runs in its OWN separate pane and targets the captain's - different panes,
+# no self-injection.
+#
+# fm_afk_start_own_backend / fm_afk_start_own_pane: this process's RAW identity.
+# Distinct from discover_supervisor_backend/discover_supervisor_target on
+# purpose - those answer "where do escalations go", which an operator may
+# override; these answer "where am I", which nothing may override. Both return
+# non-zero when this process is in no pane at all.
+fm_afk_start_own_backend() {
+  if [ -n "${TMUX_PANE:-}" ]; then
+    printf 'tmux'
+    return 0
+  fi
+  if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+    printf 'herdr'
+    return 0
+  fi
+  return 1
+}
+
+fm_afk_start_own_pane() {
+  if [ -n "${TMUX_PANE:-}" ]; then
+    printf '%s' "$TMUX_PANE"
+    return 0
+  fi
+  if [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+    printf '%s:%s' "${HERDR_SESSION:-default}" "$HERDR_PANE_ID"
+    return 0
+  fi
+  return 1
+}
+
 fm_afk_start_native_refused() {
-  local harness backend
-  [ -z "${FM_SUPERVISOR_TARGET:-}" ] || return 1
-  backend=$(discover_supervisor_backend) || true
-  [ "$backend" = herdr ] || return 1
+  local harness own_backend own_pane target
   harness=$("$FM_AFK_START_DIR/fm-harness.sh" 2>/dev/null) || harness=unknown
   [ "$harness" = claude ] || return 1
+
+  own_backend=$(fm_afk_start_own_backend) || own_backend=''
+  own_pane=$(fm_afk_start_own_pane) || own_pane=''
+  # Deliberate: an unresolvable side means the guard cannot check itself, so it
+  # permits rather than blocks on unknown state, and says so out loud instead of
+  # permitting silently.
+  if [ -z "$own_backend" ] || [ -z "$own_pane" ]; then
+    echo "afk: cannot resolve this process's own pane (no TMUX_PANE, no HERDR_ENV+HERDR_PANE_ID), so the claude+herdr self-injection guard cannot check itself; permitting this start rather than blocking on unknown state" >&2
+    return 1
+  fi
+  [ "$own_backend" = herdr ] || return 1
+
+  target=$(discover_supervisor_target) || target=''
+  if [ -z "$target" ]; then
+    echo "afk: cannot resolve the escalation injection target, so the claude+herdr self-injection guard cannot check itself; permitting this start rather than blocking on unknown state" >&2
+    return 1
+  fi
+
+  [ "$own_pane" = "$target" ] || return 1
   return 0
 }
 
@@ -167,13 +219,8 @@ fm_afk_start_main() {
     * ) echo "usage: $(basename "${BASH_SOURCE[1]:-fm-afk-start.sh}")" >&2; return 2 ;;
   esac
 
-  # Refuse BEFORE touching lifecycle state (before mkdir/flag-write), so a
-  # refusal leaves nothing to roll back.
-  if fm_afk_start_native_refused; then
-    echo "afk: refusing to host the away daemon in this pane on claude+herdr: a claude background shell renders in the captain pane's footer, herdr reads that as the agent working, so the away daemon defers forever and away mode silently delivers nothing" >&2
-    echo "afk: use 'bin/fm-afk-launch.sh start' instead (non-visible daemon terminal)" >&2
-    return 1
-  fi
+  local had_flag=0
+  [ ! -e "$FM_AFK_STATE/.afk" ] || had_flag=1
 
   mkdir -p "$FM_AFK_STATE"
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
@@ -187,6 +234,19 @@ fm_afk_start_main() {
   if daemon_lock_held_by_live_daemon; then
     echo "afk: daemon already running pid=$pid"
     return 0
+  fi
+
+  # Only a genuine FRESH start reaches the guard: a refresh of an already-live,
+  # already-safely-hosted daemon returned above untouched. Roll the away flag
+  # back when this invocation is the one that wrote it, so a refusal leaves the
+  # lifecycle exactly as it found it.
+  if fm_afk_start_native_refused; then
+    if [ "${FM_AFK_STATE_PREPARED:-0}" != 1 ] && [ "$had_flag" -eq 0 ]; then
+      rm -f "$FM_AFK_STATE/.afk" 2>/dev/null || true
+    fi
+    echo "afk: refusing to host the away daemon in the same pane it injects into on claude+herdr: a claude background shell renders in that pane's footer, herdr reads that as the agent working, so the away daemon defers forever and away mode silently delivers nothing" >&2
+    echo "afk: use 'bin/fm-afk-launch.sh start' instead (non-visible daemon terminal)" >&2
+    return 1
   fi
 
   if fm_pid_alive "$pid" && [ -n "$pid" ]; then

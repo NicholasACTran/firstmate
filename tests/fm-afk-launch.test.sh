@@ -562,60 +562,134 @@ unit_native_refuses_claude_on_herdr() {
 # UNIT: bin/fm-afk-start.sh is ALSO a documented direct entry point (the
 # native two-step's second half, and a bare direct call), so the launcher's
 # own start-native guard above does not cover it - the same wedge is reachable
-# by skipping the launcher entirely. This guard is keyed on HOSTING MODE, not
-# harness+backend alone: the launcher's terminal-backed path also execs this
-# script, but always passes FM_SUPERVISOR_TARGET explicitly (a separate pane
-# injecting into the captain's), so its presence proves a safe, already-hosted
-# invocation and must stay permitted even on claude+herdr.
+# by skipping the launcher entirely. The signal is PHYSICAL: refuse only when
+# this process's OWN pane (raw $TMUX_PANE / $HERDR_ENV+$HERDR_PANE_ID) is the
+# very pane escalations will be injected into (discover_supervisor_target,
+# which honours the FM_SUPERVISOR_TARGET override). Same pane on claude+herdr
+# means the daemon hosts itself in the pane it drives - the wedge. Different
+# panes (the launcher's own separate terminal targeting the captain's) stay
+# permitted, and so does an operator override pointing somewhere else: the
+# comparison is where-am-I vs where-does-injection-land, never the mere
+# presence of a documented env knob.
 # ---------------------------------------------------------------------------
-unit_start_refuses_direct_claude_on_herdr() {
-  local st out refused=0
+START_GUARD_CLEAN_ENV=(env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u CLAUDECODE -u PI_CODING_AGENT
+  -u GROK_AGENT -u TMUX_PANE -u FM_SUPERVISOR_TARGET -u FM_SUPERVISOR_BACKEND
+  -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_SESSION)
+
+# Run fm_afk_start_main in a child shell with a harmless daemon stand-in, so a
+# PERMITTED start is observable as its own announcement rather than by execing
+# the real daemon. Prints combined output; returns the real exit status.
+start_guard_run() {  # <state-dir> <env assignment>...
+  local st=$1; shift
+  # shellcheck disable=SC2016 # $1 is bash -c's own positional param.
+  "${START_GUARD_CLEAN_ENV[@]}" FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$@" bash -c '
+    . "$1"
+    FM_AFK_DAEMON=/bin/true
+    fm_afk_start_main
+  ' _ "$START" 2>&1
+}
+
+unit_start_refuses_self_injecting_claude_on_herdr() {
+  local st out status
+
+  # (1) claude+herdr, own pane IS the injection target -> refused, and no
+  # lifecycle state left behind.
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-start-guard.XXXXXX")
   mkdir -p "$st/state"
-  out=$(env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u PI_CODING_AGENT -u GROK_AGENT -u TMUX_PANE \
-    -u FM_SUPERVISOR_TARGET -u FM_SUPERVISOR_BACKEND \
-    CLAUDECODE=1 HERDR_ENV=1 HERDR_PANE_ID=pane-1 FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
-    "$START" 2>&1) || refused=1
-  if [ "$refused" -eq 1 ] && [ ! -e "$st/state/.afk" ]; then
-    pass "start guard: direct claude+herdr entry is refused with no lifecycle state written"
+  status=0
+  out=$(start_guard_run "$st" CLAUDECODE=1 HERDR_ENV=1 HERDR_PANE_ID=pane-1) || status=$?
+  if [ "$status" -ne 0 ] && [ ! -e "$st/state/.afk" ]; then
+    pass "start guard: claude+herdr self-injection is refused with no lifecycle state left behind"
   else
-    fail "start guard: direct claude+herdr entry was accepted"
+    fail "start guard: claude+herdr self-injection was accepted ($out)"
   fi
   case "$out" in
     *'bin/fm-afk-launch.sh start'*) pass "start guard: refusal names the terminal-backed path" ;;
-    *) fail "start guard: refusal did not name the terminal-backed path" ;;
+    *) fail "start guard: refusal did not name the terminal-backed path ($out)" ;;
   esac
   rm -rf "$st"
 
+  # (2) claude+herdr, launcher-placed separate terminal: own pane differs from
+  # the captain pane it injects into -> permitted (not a blanket block).
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-start-guard.XXXXXX")
   mkdir -p "$st/state"
-  # shellcheck disable=SC2016 # $1 is bash -c's own positional param, not this shell's.
-  out=$(env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u PI_CODING_AGENT -u GROK_AGENT -u TMUX_PANE \
-    CLAUDECODE=1 HERDR_ENV=1 HERDR_PANE_ID=pane-1 FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
-    FM_SUPERVISOR_TARGET=captain FM_SUPERVISOR_BACKEND=herdr bash -c '
-      . "$1"
-      FM_AFK_DAEMON=/bin/true
-      fm_afk_start_main
-    ' _ "$START" 2>&1)
+  out=$(start_guard_run "$st" CLAUDECODE=1 HERDR_ENV=1 HERDR_PANE_ID=daemon-pane \
+    FM_SUPERVISOR_TARGET=default:captain-pane FM_SUPERVISOR_BACKEND=herdr)
   case "$out" in
-    *'starting supervise daemon'*) pass "start guard: claude+herdr is still permitted when launcher-hosted (FM_SUPERVISOR_TARGET set)" ;;
-    *) fail "start guard: claude+herdr launcher-hosted entry was refused ($out)" ;;
+    *'starting supervise daemon'*) pass "start guard: claude+herdr in the launcher's own separate pane is permitted" ;;
+    *) fail "start guard: launcher-hosted claude+herdr entry was refused ($out)" ;;
   esac
   rm -rf "$st"
 
+  # (3) claude+herdr with a hand-set FM_SUPERVISOR_TARGET pointing at a pane
+  # this process is NOT running in -> permitted: no self-injection.
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-start-guard.XXXXXX")
   mkdir -p "$st/state"
-  # shellcheck disable=SC2016 # $1 is bash -c's own positional param, not this shell's.
-  out=$(env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u CLAUDECODE -u GROK_AGENT -u TMUX_PANE \
-    -u FM_SUPERVISOR_TARGET -u FM_SUPERVISOR_BACKEND \
-    PI_CODING_AGENT=true HERDR_ENV=1 HERDR_PANE_ID=pane-1 FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+  out=$(start_guard_run "$st" CLAUDECODE=1 HERDR_ENV=1 HERDR_PANE_ID=pane-1 \
+    FM_SUPERVISOR_TARGET=default:some-other-pane)
+  case "$out" in
+    *'starting supervise daemon'*) pass "start guard: an override naming a different pane is permitted" ;;
+    *) fail "start guard: an override naming a different pane was refused ($out)" ;;
+  esac
+  rm -rf "$st"
+
+  # (3b) the same documented override pointed AT this process's own pane is
+  # still refused: the comparison is physical, not override-presence-based.
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-start-guard.XXXXXX")
+  mkdir -p "$st/state"
+  status=0
+  out=$(start_guard_run "$st" CLAUDECODE=1 HERDR_ENV=1 HERDR_PANE_ID=pane-1 \
+    FM_SUPERVISOR_TARGET=default:pane-1 FM_SUPERVISOR_BACKEND=herdr) || status=$?
+  if [ "$status" -ne 0 ] && [ ! -e "$st/state/.afk" ]; then
+    pass "start guard: an override naming this process's own pane is still refused"
+  else
+    fail "start guard: an operator-set override reopened the self-injection wedge ($out)"
+  fi
+  rm -rf "$st"
+
+  # (4) a non-claude primary in the same pane -> permitted: only claude's
+  # footer token wedges herdr's detection.
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-start-guard.XXXXXX")
+  mkdir -p "$st/state"
+  out=$(start_guard_run "$st" PI_CODING_AGENT=true HERDR_ENV=1 HERDR_PANE_ID=pane-1)
+  case "$out" in
+    *'starting supervise daemon'*) pass "start guard: a non-claude harness in the same pane is permitted" ;;
+    *) fail "start guard: a non-claude harness in the same pane was refused ($out)" ;;
+  esac
+  rm -rf "$st"
+
+  # (5) a refresh of an already-live daemon takes the existing refresh path
+  # untouched: nothing is being started, so nothing is refused.
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-start-guard.XXXXXX")
+  mkdir -p "$st/state"
+  status=0
+  # shellcheck disable=SC2016 # $1 is bash -c's own positional param.
+  out=$("${START_GUARD_CLEAN_ENV[@]}" CLAUDECODE=1 HERDR_ENV=1 HERDR_PANE_ID=pane-1 \
+    FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
       . "$1"
       FM_AFK_DAEMON=/bin/true
+      daemon_lock_pid() { echo 4242; }
+      daemon_lock_held_by_live_daemon() { return 0; }
       fm_afk_start_main
-    ' _ "$START" 2>&1)
+    ' _ "$START" 2>&1) || status=$?
+  case "$status:$out" in
+    0*'daemon already running pid=4242'*) pass "start guard: a refresh of a live daemon takes the refresh path, not the refusal" ;;
+    *) fail "start guard: a refresh of a live daemon was refused (status=$status) ($out)" ;;
+  esac
+  rm -rf "$st"
+
+  # (6) neither side resolvable -> permitted, but the guard says out loud that
+  # it could not check itself rather than permitting silently.
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-start-guard.XXXXXX")
+  mkdir -p "$st/state"
+  out=$(start_guard_run "$st" CLAUDECODE=1)
   case "$out" in
-    *'starting supervise daemon'*) pass "start guard: a non-claude harness on herdr direct entry is still permitted" ;;
-    *) fail "start guard: a non-claude harness on herdr direct entry was refused ($out)" ;;
+    *'starting supervise daemon'*) pass "start guard: an unresolvable pane permits rather than blocks" ;;
+    *) fail "start guard: an unresolvable pane was refused ($out)" ;;
+  esac
+  case "$out" in
+    *"cannot resolve this process's own pane"*) pass "start guard: unresolvable state emits the could-not-check diagnostic" ;;
+    *) fail "start guard: unresolvable state permitted silently ($out)" ;;
   esac
   rm -rf "$st"
 }
@@ -1056,7 +1130,7 @@ unit_readiness_failure_preserves_unconfirmed_record
 unit_tmux_absence_distinguishes_probe_failure
 unit_native_lifecycle
 unit_native_refuses_claude_on_herdr
-unit_start_refuses_direct_claude_on_herdr
+unit_start_refuses_self_injecting_claude_on_herdr
 unit_native_entry_preserves_prepared_state
 unit_close_failure_preserves_record
 unit_record_publication_atomic
