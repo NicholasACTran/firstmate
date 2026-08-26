@@ -705,6 +705,7 @@ unit_native_entry_preserves_prepared_state() {
   mkdir -p "$st/state"
   : > "$st/state/.afk"
   : > "$st/state/.subsuper-escalations"
+  # shellcheck disable=SC2016 # $1 is bash -c's own positional param.
   "${START_GUARD_CLEAN_ENV[@]}" FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
     FM_AFK_STATE_PREPARED=1 bash -c '
     . "$1"
