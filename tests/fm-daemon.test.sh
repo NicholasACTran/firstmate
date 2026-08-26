@@ -1835,14 +1835,32 @@ test_inject_msg_herdr_busy_guard_defers() {
 }
 
 # Bounding fix (firstmate-afk-daemon-wedged-investigation, 2026-08-26; redesigned
-# per review round 6): a busy verdict paired with a PROVABLY EMPTY composer is
-# the exact false-positive the daemon's own in-pane launch method can cause,
-# and the max-defer retry used to re-enter this same guard forever. inject_msg
-# now measures how long THIS escalation has been undelivered via the existing
-# durable state/.subsuper-escalations.since (already maintained by
-# escalate_add/escalate_flush for FM_MAX_DEFER_SECS) rather than a clock of its
-# own, and keeps deferring - never submitting on this path alone - until
-# FM_BUSY_GUARD_ESCAPE_SECS has elapsed since that escalation arrived.
+# again per the escape-clock-measures-total-age review): a busy verdict paired
+# with a PROVABLY EMPTY composer is the exact false-positive the daemon's own
+# in-pane launch method can cause, and the max-defer retry used to re-enter this
+# same guard forever. inject_msg now measures ONLY that disagreement - the
+# mtime of the durable state/.subsuper-busy-empty-streak-since marker, created
+# on the first busy+confirmed-empty observation and removed the instant the
+# streak breaks - and keeps deferring until FM_BUSY_GUARD_ESCAPE_SECS of that
+# continuous streak has elapsed. It is explicitly NOT the escalation's own
+# undelivered age (state/.subsuper-escalations.since, which belongs to the
+# unrelated FM_MAX_DEFER_SECS mechanism) and NOT a process-local clock.
+
+# Backdate a file's mtime by <secs> seconds, portably (BSD `touch -t` vs GNU
+# `touch -d @epoch`), so a test can present a streak of any age without
+# sleeping. Mirrors the daemon's own Darwin/else split for reading mtimes.
+backdate_mtime() {  # <file> <secs-ago>
+  local f=$1 secs=$2 epoch
+  epoch=$(( $(date +%s) - secs ))
+  if [ "$(uname -s)" = Darwin ]; then
+    touch -t "$(date -r "$epoch" +%Y%m%d%H%M.%S)" "$f"
+  else
+    touch -d "@$epoch" "$f"
+  fi
+}
+
+STREAK_MARKER_NAME=.subsuper-busy-empty-streak-since
+
 test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold() {
   local dir state
   dir=$(make_supercase inject-busy-empty-composer-early)
@@ -1850,7 +1868,7 @@ test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold() {
   afk_enter "$state"
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
-  _now > "$state/.subsuper-escalations.since"  # just arrived
+  _now > "$state/.subsuper-escalations.since"
   (
     FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
@@ -1858,16 +1876,45 @@ test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold() {
     fm_backend_composer_state() { printf 'empty'; }
     fm_backend_send_text_submit() { fail "send_text_submit must not run before the escape threshold elapses"; }
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
-      fail "inject_msg should still defer on a just-arrived escalation"
+      fail "inject_msg should still defer on a just-started busy+empty streak"
     fi
   ) || fail "busy+empty-composer pre-escape subshell failed"
+  assert_present "$state/$STREAK_MARKER_NAME" \
+    "the first busy+confirmed-empty observation should start a durable streak marker"
   pass "inject_msg: busy verdict with a confirmed-empty composer still defers until the escape threshold elapses"
 }
 
-# Review fix (redesign, PR #3090 round 6): the escape is anchored to the
-# escalation's own durable arrival time (state/.subsuper-escalations.since),
-# not a clock inject_msg maintains itself, so it needs no _now stubbing here -
-# real file timestamps in the past are enough.
+# Regression for escape-clock-measures-total-age: the escape must NOT fire just
+# because the escalation itself is old. An escalation can sit undelivered for
+# reasons that have nothing to do with the busy guard (a human's half-typed
+# composer draft defers every flush), and the busy+empty disagreement that this
+# bound exists to cap may only have begun this instant - which is the normal
+# state of a CORRECTLY working agent that just started a turn. Against the
+# prior escalation-age-anchored version this test fails: that version read
+# age=100000 from .subsuper-escalations.since and typed into a genuinely busy
+# pane on the very first busy+empty observation.
+test_inject_msg_busy_guard_escape_ignores_old_escalation_with_fresh_streak() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-old-escalation-fresh-streak)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$state/.subsuper-escalations.since"
+  [ ! -e "$state/$STREAK_MARKER_NAME" ] || fail "test setup: the streak must not exist yet"
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "an old escalation must not license an escape on a brand-new busy+empty streak"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg escaped the busy guard with zero seconds of observed busy/composer disagreement"
+    fi
+  ) || fail "old-escalation/fresh-streak subshell failed"
+  pass "inject_msg: a long-undelivered escalation does not shorten the busy-guard escape window - only the busy+empty streak counts"
+}
+
 test_inject_msg_busy_guard_escapes_after_threshold() {
   local dir state
   dir=$(make_supercase inject-busy-guard-escape)
@@ -1875,7 +1922,9 @@ test_inject_msg_busy_guard_escapes_after_threshold() {
   afk_enter "$state"
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
-  printf '%s\n' "$(( $(date +%s) - 300 ))" > "$state/.subsuper-escalations.since"
+  _now > "$state/.subsuper-escalations.since"
+  : > "$state/$STREAK_MARKER_NAME"
+  backdate_mtime "$state/$STREAK_MARKER_NAME" 300
   (
     LOG="$state/daemon.log"
     FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
@@ -1884,11 +1933,39 @@ test_inject_msg_busy_guard_escapes_after_threshold() {
     fm_backend_composer_state() { printf 'empty'; }
     fm_backend_send_text_submit() { printf 'empty'; }
     FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
-      || fail "inject_msg should deliver once this escalation has gone undelivered for the full escape threshold"
+      || fail "inject_msg should deliver once the busy+empty streak has run the full escape threshold"
     assert_grep "inject busy-guard override" "$LOG" \
       "a fired escape should log that it overrode the busy guard: $(cat "$LOG" 2>/dev/null)"
   ) || fail "busy-guard escape-after-threshold subshell failed"
-  pass "inject_msg: delivers past a stale busy verdict once this escalation has gone undelivered for the full escape threshold"
+  assert_absent "$state/$STREAK_MARKER_NAME" \
+    "a fired escape should clear the streak marker so the next attempt starts a fresh streak"
+  pass "inject_msg: delivers past a stale busy verdict once the busy+empty streak has run the full escape threshold"
+}
+
+# The escape path must not pay a second full backend capture for a composer
+# value nothing between the two reads could have changed.
+test_inject_msg_busy_guard_escape_reads_composer_once() {
+  local dir state reads
+  dir=$(make_supercase inject-busy-guard-escape-one-read)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  _now > "$state/.subsuper-escalations.since"
+  : > "$state/$STREAK_MARKER_NAME"
+  backdate_mtime "$state/$STREAK_MARKER_NAME" 300
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'x' >> "$state/composer-reads"; printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
+      || fail "the escape should have delivered"
+  ) || fail "escape composer-read-count subshell failed"
+  reads=$(wc -c < "$state/composer-reads" | tr -d ' ')
+  [ "$reads" -eq 1 ] || fail "the escape path probed the composer $reads times; the confirmed-empty read from the busy branch should be reused"
+  pass "inject_msg: a fired escape reuses its confirmed-empty composer read instead of probing the backend twice"
 }
 
 test_inject_msg_busy_guard_escape_one_second_short_still_defers() {
@@ -1898,7 +1975,9 @@ test_inject_msg_busy_guard_escape_one_second_short_still_defers() {
   afk_enter "$state"
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
-  printf '%s\n' "$(( $(date +%s) - 299 ))" > "$state/.subsuper-escalations.since"
+  _now > "$state/.subsuper-escalations.since"
+  : > "$state/$STREAK_MARKER_NAME"
+  backdate_mtime "$state/$STREAK_MARKER_NAME" 299
   (
     FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
@@ -1919,7 +1998,9 @@ test_inject_msg_busy_guard_escape_disabled_by_zero() {
   afk_enter "$state"
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
-  printf '%s\n' "$(( $(date +%s) - 999999 ))" > "$state/.subsuper-escalations.since"
+  _now > "$state/.subsuper-escalations.since"
+  : > "$state/$STREAK_MARKER_NAME"
+  backdate_mtime "$state/$STREAK_MARKER_NAME" 999999
   (
     FM_BUSY_GUARD_ESCAPE_SECS=0 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
@@ -1927,24 +2008,114 @@ test_inject_msg_busy_guard_escape_disabled_by_zero() {
     fm_backend_composer_state() { printf 'empty'; }
     fm_backend_send_text_submit() { fail "send_text_submit must not run when FM_BUSY_GUARD_ESCAPE_SECS=0 disables the escape"; }
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
-      fail "inject_msg should never escape the busy guard when FM_BUSY_GUARD_ESCAPE_SECS=0, no matter how long undelivered"
+      fail "inject_msg should never escape the busy guard when FM_BUSY_GUARD_ESCAPE_SECS=0, no matter how long the streak"
     fi
   ) || fail "busy-guard escape-disabled subshell failed"
   pass "inject_msg: FM_BUSY_GUARD_ESCAPE_SECS=0 keeps the busy guard deferring forever, matching the pre-fix behavior"
 }
 
-# Review fix (redesign, PR #3090 round 6): Greptile found a real hole in the
-# in-process-clock version of this fix - the daemon has a crash-loop guard, so
-# restarts are a real, expected event, and a persistent busy false-positive
-# combined with repeated restarts reset an in-process clock every time,
-# deferring forever. The escape is now anchored to
-# state/.subsuper-escalations.since, which is tied to live undelivered work
-# (created when an escalation lands in an empty buffer, removed on successful
-# delivery), not to the daemon process's lifetime - so a restart cannot reset
-# it. This test asserts the PROPERTY across two entirely separate subshells
-# (no shared bash state between them, only the durable file) and would FAIL
-# against the in-process-clock version: that version's fresh subshell would
-# see age 0 and defer, instead of correctly escaping.
+# The streak must measure a CONTINUOUS disagreement, so any observation that
+# breaks it discards the elapsed time rather than letting a later busy+empty
+# observation resume an interrupted run.
+test_inject_msg_busy_guard_streak_resets_when_composer_stops_reading_empty() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-streak-reset-composer)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  _now > "$state/.subsuper-escalations.since"
+  : > "$state/$STREAK_MARKER_NAME"
+  backdate_mtime "$state/$STREAK_MARKER_NAME" 299
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'pending'; }
+    fm_backend_send_text_submit() { fail "a pending composer must never be injected into"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg should defer on a pending composer"
+    fi
+  ) || fail "streak-reset-on-pending-composer subshell failed"
+  assert_absent "$state/$STREAK_MARKER_NAME" \
+    "a composer that stopped reading empty should discard the accumulated streak"
+
+  # A later busy+empty observation must start over, not inherit the old 299s.
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "the broken streak must not resume where it left off"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg escaped using a streak that had already been broken"
+    fi
+  ) || fail "post-reset subshell failed"
+  pass "inject_msg: a composer verdict other than empty resets the busy+empty streak, and the next streak starts from zero"
+}
+
+test_inject_msg_busy_guard_streak_resets_when_pane_stops_reading_busy() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-streak-reset-idle)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  _now > "$state/.subsuper-escalations.since"
+  : > "$state/$STREAK_MARKER_NAME"
+  backdate_mtime "$state/$STREAK_MARKER_NAME" 299
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
+      || fail "an idle pane with an empty composer should deliver normally"
+  ) || fail "streak-reset-on-idle subshell failed"
+  assert_absent "$state/$STREAK_MARKER_NAME" \
+    "a non-busy verdict should discard the accumulated streak"
+  pass "inject_msg: a non-busy verdict resets the busy+empty streak"
+}
+
+# Fail-closed: a marker that cannot be created or stat'd must read as age 0
+# (keep deferring), never as _file_age's "missing = 999999" sentinel. Treating
+# an unknown age as maximally old would bypass the entire window on the very
+# first attempt - exactly the unbounded behavior this bound exists to end.
+test_inject_msg_busy_guard_streak_marker_uncreatable_fails_closed() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-streak-unwritable)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  printf '%s\n' "$(( $(date +%s) - 999999 ))" > "$state/.subsuper-escalations.since"
+  # A directory at the marker path: `: > marker` cannot create it and
+  # `_stat_file_mtime` would report the DIRECTORY's mtime, so this also proves
+  # the age never comes from something other than a real streak file.
+  mkdir -p "$state/$STREAK_MARKER_NAME"
+  backdate_mtime "$state/$STREAK_MARKER_NAME" 999999
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "an unwritable streak marker must never bypass the escape window"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg escaped the busy guard on an unusable streak marker"
+    fi
+  ) || fail "fail-closed streak-marker subshell failed"
+  pass "inject_msg: an uncreatable streak marker fails closed (age 0, keep deferring) instead of reading as infinitely old"
+}
+
+# Greptile found a real hole in the in-process-clock version of this fix - the
+# daemon has a crash-loop guard, so restarts are a real, expected event, and a
+# persistent busy false-positive combined with repeated restarts reset an
+# in-process clock every time, deferring forever. The streak marker is durable
+# on disk, so a restart cannot reset it. This asserts the PROPERTY across two
+# entirely separate subshells (no shared bash state between them, only the file
+# on disk) and would FAIL against the in-process-clock version: that version's
+# fresh subshell would see age 0 and defer, instead of correctly escaping.
 test_inject_msg_busy_guard_restart_does_not_reset_deadline() {
   local dir state
   dir=$(make_supercase inject-busy-guard-restart-deadline)
@@ -1952,25 +2123,27 @@ test_inject_msg_busy_guard_restart_does_not_reset_deadline() {
   afk_enter "$state"
   mkdir -p "$state"
   printf 'digest item\n' > "$state/.subsuper-escalations"
-  printf '%s\n' "$(( $(date +%s) - 1 ))" > "$state/.subsuper-escalations.since"  # arrived ~1s ago
+  _now > "$state/.subsuper-escalations.since"
 
-  # "First daemon process": not yet due (escape_secs=3, only ~1s elapsed).
+  # "First daemon process": the streak starts here and is not yet due
+  # (escape_secs=3, ~0s elapsed).
   (
     FM_BUSY_GUARD_ESCAPE_SECS=3 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
     pane_is_busy() { return 0; }
     fm_backend_composer_state() { printf 'empty'; }
-    fm_backend_send_text_submit() { fail "must not escape yet - only ~1s of a 3s threshold has elapsed"; }
+    fm_backend_send_text_submit() { fail "must not escape yet - the streak has just begun"; }
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
       fail "inject_msg should still defer before the threshold"
     fi
   ) || fail "pre-restart subshell failed"
+  assert_present "$state/$STREAK_MARKER_NAME" "the first process should have started the durable streak"
 
-  sleep 2.5
+  sleep 3.5
 
   # "Daemon restarted": a completely separate subshell sharing no bash
-  # variables with the one above - only the durable .subsuper-escalations.since
-  # file on disk. The SAME escalation has now been undelivered for >3s.
+  # variables with the one above - only the durable marker file on disk. The
+  # SAME streak has now been running for >3s.
   (
     FM_BUSY_GUARD_ESCAPE_SECS=3 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
@@ -1978,9 +2151,9 @@ test_inject_msg_busy_guard_restart_does_not_reset_deadline() {
     fm_backend_composer_state() { printf 'empty'; }
     fm_backend_send_text_submit() { printf 'empty'; }
     FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
-      || fail "a fresh process must still see this escalation as overdue - a restart must not reset the deadline"
+      || fail "a fresh process must still see the streak as overdue - a restart must not reset the deadline"
   ) || fail "post-restart subshell failed"
-  pass "inject_msg: a daemon restart does not reset the busy-guard escape deadline - it is anchored to the escalation's own durable arrival time, not a process-local clock"
+  pass "inject_msg: a daemon restart does not reset the busy-guard escape deadline - the streak lives in a durable marker, not a process-local clock"
 }
 
 # Review fix (redesign, PR #3090 round 4): FM_BUSY_GUARD_ESCAPE_SECS is now
@@ -2285,9 +2458,14 @@ test_inject_msg_herdr_submits_through_backend_dispatch
 test_inject_msg_defers_on_dead_shell_unknown
 test_inject_msg_defers_on_unrecognized_composer_state
 test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold
+test_inject_msg_busy_guard_escape_ignores_old_escalation_with_fresh_streak
 test_inject_msg_busy_guard_escapes_after_threshold
+test_inject_msg_busy_guard_escape_reads_composer_once
 test_inject_msg_busy_guard_escape_one_second_short_still_defers
 test_inject_msg_busy_guard_escape_disabled_by_zero
+test_inject_msg_busy_guard_streak_resets_when_composer_stops_reading_empty
+test_inject_msg_busy_guard_streak_resets_when_pane_stops_reading_busy
+test_inject_msg_busy_guard_streak_marker_uncreatable_fails_closed
 test_inject_msg_busy_guard_restart_does_not_reset_deadline
 test_resolve_busy_guard_escape_secs_valid_and_leading_zero_values
 test_resolve_busy_guard_escape_secs_clamp_boundary

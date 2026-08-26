@@ -101,6 +101,9 @@ backend (tmux or herdr; see "Auto-discovered supervisor pane" below):
   `pane_input_pending` is the tested fail-closed predicate for callers that need to know whether the composer is unsafe: it treats every result except exact `empty` as pending.
 
 A busy primary pane, or any composer verdict other than `empty`, defers the injection; the buffered escalation survives in `state/.subsuper-escalations` and is retried on the next housekeeping tick.
+The one exception is the busy guard's bounded escape: when a busy verdict has disagreed with an affirmatively `empty` composer continuously for `FM_BUSY_GUARD_ESCAPE_SECS` (default 300; 0 disables), `inject_msg` stops trusting the busy verdict and delivers instead of deferring again.
+That continuous streak is measured by the mtime of the durable `state/.subsuper-busy-empty-streak-since` marker, which is created on the first busy-plus-confirmed-empty observation and removed the instant the streak breaks (any composer verdict other than `empty`, any non-busy verdict), once the escape fires, and on a fresh away-session entry.
+Nothing else escapes: a composer that is not confirmed `empty` still defers unconditionally, and a busy pane whose streak has not yet reached the threshold defers exactly as documented above.
 In afk mode the composer guard is belt-and-suspenders (no human is typing), but it protects against the race window between the captain returning and their message landing, a dead shell, and the daemon's own previous injection sitting unsent.
 
 **Max-defer escape (the daemon must never silently wedge).**
@@ -216,7 +219,7 @@ the operational prefix lets firstmate distinguish it from a real captain message
 
 ## Stale-artifact lifecycle
 
-Treat `state/.subsuper-escalations`, its `.since` sidecar, and `state/.subsuper-inject-wedged` as session-scoped delivery artifacts, not as the durable work record.
+Treat `state/.subsuper-escalations`, its `.since` sidecar, `state/.subsuper-busy-empty-streak-since`, and `state/.subsuper-inject-wedged` as session-scoped delivery artifacts, not as the durable work record.
 Always enter through `bin/fm-afk-launch.sh`, which clears prior-session artifacts only for a fresh entry and preserves the current session's buffer on refresh.
 Always exit through `bin/fm-afk-launch.sh stop`, which keeps `state/.afk` present through the daemon's shutdown flush and clears it last.
 `docs/herdr-backend.md` "Away-mode supervisor support" owns the current mechanism, and `docs/verification/runtime-backends.md` "Away-mode transport" owns active evidence.

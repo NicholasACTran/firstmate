@@ -1212,7 +1212,7 @@ resolve_busy_guard_escape_secs() {
 #     would merge with the human's text.
 inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer encoded \
-        age escape_secs
+        streak_marker streak_age streak_mtime escape_secs escape_fired
   state="${2:-$(_state_root)}"
   # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
   # daemon self-handles and stays quiet; firstmate drives the normal always-on
@@ -1241,44 +1241,70 @@ inject_msg() {  # <message> [state]
   # read permanently busy to herdr), and the max-defer retry above re-enters
   # this same guard, so an unbounded silence was possible. The composer read
   # is the accurate signal - it reads the actual input area and has never once
-  # been the deferring guard across six observed runs - so once this
-  # delivery obligation has been outstanding for
+  # been the deferring guard across six observed runs - so once the busy
+  # verdict has disagreed with a confirmed-empty composer for
   # BUSY_GUARD_ESCAPE_SECS_RESOLVED straight, delivering is safer than
   # deferring again. Only an exact 'empty' composer read counts: pending,
   # unknown, and a bare dead-shell prompt still defer with no escape.
   #
-  # The elapsed time is the age of the OLDEST buffered escalation
-  # (state/.subsuper-escalations.since, already maintained by escalate_add /
-  # escalate_flush for FM_MAX_DEFER_SECS), not a busy-guard-specific clock.
-  # That is deliberate: an in-process variable resets on every daemon
-  # restart, and the crash-loop guard above makes restarts a real, expected
-  # event, not a rare one - a persistent busy false positive combined with
-  # repeated restarts would then defer forever, which is the exact failure
-  # this ticket exists to end. The escalation's own age is tied to live
-  # undelivered work, not to the daemon process's lifetime or the away
-  # session: it is created only when an escalation lands in an empty buffer
-  # and removed the moment delivery succeeds, so a value surviving a restart
-  # is not stale data, it is an honest measurement of how long this exact
-  # escalation has genuinely gone undelivered. escalate_flush's own
-  # "[ -s "$buf" ] || return 0" guard means inject_msg is only ever reached
-  # here with a non-empty buffer, so the `.since` file is always present at
-  # this point.
+  # The elapsed time measured here is EXACTLY that disagreement and nothing
+  # else: state/.subsuper-busy-empty-streak-since is a durable marker whose
+  # mtime records when the CURRENT continuous run of (busy verdict AND
+  # confirmed-empty composer) observations began. It is created on the first
+  # such observation and removed the instant the streak breaks - on any
+  # composer read that is not exactly 'empty', on any non-busy verdict, and
+  # once the escape has fired. It is deliberately NOT the escalation's own
+  # undelivered age (state/.subsuper-escalations.since, which belongs to the
+  # unrelated FM_MAX_DEFER_SECS mechanism): that age also accrues while
+  # delivery is deferred for reasons that have nothing to do with the busy
+  # guard - a human's half-typed composer draft, for one - so anchoring to it
+  # could fire the escape on the very first busy+empty observation, typing
+  # into a pane that had just genuinely started a turn. It is equally NOT an
+  # in-process variable: the crash-loop guard above makes daemon restarts a
+  # real, expected event, and a process-local clock would reset on each one,
+  # so a persistent false positive plus repeated restarts would defer forever
+  # - the exact failure this bound exists to end. A fresh away-session entry
+  # clears this marker along with the other delivery artifacts
+  # (fm_afk_clear_stale_artifacts, bin/fm-afk-start.sh), so a streak can never
+  # carry over from a prior session either.
+  #
+  # Fail-closed: if the marker cannot be created, is not a regular file, or
+  # cannot be stat'd, the streak age is 0 (keep deferring). An unreadable or
+  # absent marker must never read as infinitely old -
+  # that would bypass the entire window on the first attempt, which is the
+  # bound's whole purpose.
+  streak_marker="$state/.subsuper-busy-empty-streak-since"
+  escape_fired=0
   if pane_is_busy "$target" "$backend"; then
     composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
     if [ "$composer" != empty ]; then
+      rm -f "$streak_marker" 2>/dev/null || true
       log "inject deferred: supervisor pane busy (${PANE_BUSY_LAST_SOURCE:-agent mid-turn})"
       return 1
     fi
-    age=$(_oldest_line_age "$state/.subsuper-escalations")
+    [ -f "$streak_marker" ] || { : > "$streak_marker"; } 2>/dev/null || true
+    streak_age=0
+    if [ -f "$streak_marker" ]; then
+      streak_mtime=$(_stat_file_mtime "$streak_marker") || streak_mtime=
+      if [ -n "$streak_mtime" ]; then
+        streak_age=$(( $(_now) - streak_mtime ))
+        [ "$streak_age" -ge 0 ] || streak_age=0
+      fi
+    fi
     escape_secs=${BUSY_GUARD_ESCAPE_SECS_RESOLVED:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT}
-    if [ "$escape_secs" -gt 0 ] && [ "$age" -ge "$escape_secs" ]; then
-      log "inject busy-guard override: ${PANE_BUSY_LAST_SOURCE:-native agent-state} read busy while this escalation has gone undelivered for ${age}s; delivering instead of deferring further"
-      # Fall through: composer confirmed empty, so the guard below re-checks
-      # it once more immediately before typing and the submit proceeds.
+    if [ "$escape_secs" -gt 0 ] && [ "$streak_age" -ge "$escape_secs" ]; then
+      escape_fired=1
+      rm -f "$streak_marker" 2>/dev/null || true
+      log "inject busy-guard override: ${PANE_BUSY_LAST_SOURCE:-native agent-state} has read busy against a confirmed-empty composer for ${streak_age}s straight; delivering instead of deferring further"
+      # Fall through with composer already confirmed 'empty' by the read
+      # above; the guard below reuses that verdict rather than paying a
+      # second full backend capture for a value nothing could have changed.
     else
-      log "inject deferred: supervisor pane busy (${PANE_BUSY_LAST_SOURCE:-agent mid-turn}); composer confirmed-empty, undelivered for ${age}s, escapes at ${escape_secs}s"
+      log "inject deferred: supervisor pane busy (${PANE_BUSY_LAST_SOURCE:-agent mid-turn}); composer confirmed-empty for ${streak_age}s straight, escapes at ${escape_secs}s"
       return 1
     fi
+  else
+    rm -f "$streak_marker" 2>/dev/null || true
   fi
   #   b) Composer-guard: inject ONLY into a confirmed-empty GENUINE agent
   #      composer. The shared classifier (fm_backend_composer_state ->
@@ -1289,7 +1315,11 @@ inject_msg() {  # <message> [state]
   #      target - typing the escalation into a shell could execute it - so defer
   #      on anything that is not affirmatively 'empty'. A deferred escalation
   #      stays buffered for the next cycle or the catch-up flush.
-  composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
+  #      When the busy-guard escape above already fired, `composer` still holds
+  #      that branch's confirmed-'empty' read and is reused verbatim: nothing
+  #      between there and here can change the composer, so a second capture
+  #      would be a duplicate probe, not a re-check.
+  [ "$escape_fired" -eq 1 ] || composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
   if [ "$composer" != empty ]; then
     log "inject deferred: supervisor composer not confirmed-empty (state=${composer:-unknown}: pending input, dead-shell prompt, or unreadable pane)"
     return 1
