@@ -1822,13 +1822,119 @@ test_inject_msg_herdr_busy_guard_defers() {
   (
     fm_backend_target_exists() { [ "$1" = herdr ] && [ "$2" = "default:w1:p2" ] || fail "unexpected target_exists args: $1 $2"; return 0; }
     pane_is_busy() { return 0; }
-    fm_backend_composer_state() { fail "composer_state should not be consulted once the busy-guard already deferred"; }
+    # A busy verdict now also consults the composer (the escape-hatch's
+    # eligibility check): with the composer NOT confirmed empty, the busy
+    # guard still defers exactly as before and never reaches submit.
+    fm_backend_composer_state() { printf 'pending'; }
     fm_backend_send_text_submit() { fail "send_text_submit should not run when the busy-guard defers"; }
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
       fail "inject_msg should defer (return non-zero) when the herdr supervisor pane is busy"
     fi
+    assert_absent "$state/.subsuper-busy-guard-since" \
+      "no escape-hatch clock should start while the composer is not confirmed empty"
   ) || fail "herdr busy-guard inject_msg subshell failed"
   pass "inject_msg: herdr busy-guard defers before ever attempting a submit"
+}
+
+# Bounding fix (firstmate-afk-daemon-wedged-investigation, 2026-08-26): a busy
+# verdict paired with a PROVABLY EMPTY composer is the exact false-positive the
+# daemon's own in-pane launch method can cause, and the max-defer retry used to
+# re-enter this same guard forever. inject_msg now starts a durable clock the
+# first time it sees busy+empty-composer together and keeps deferring - never
+# submitting on this path alone - until FM_BUSY_GUARD_ESCAPE_SECS has elapsed.
+test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold() {
+  local dir state
+  dir=$(make_supercase inject-busy-empty-composer-early)
+  state="$dir/state"
+  afk_enter "$state"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { PANE_BUSY_LAST_SOURCE="native agent-state (agent_status=busy)"; return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "send_text_submit must not run before the escape threshold elapses"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=300 \
+        inject_msg "hello" "$state"; then
+      fail "inject_msg should still defer on the first busy+empty-composer observation"
+    fi
+    assert_present "$state/.subsuper-busy-guard-since" \
+      "the first busy+empty-composer observation should start the escape-hatch clock"
+  ) || fail "busy+empty-composer pre-escape subshell failed"
+  pass "inject_msg: busy verdict with a confirmed-empty composer still defers until the escape threshold elapses"
+}
+
+test_inject_msg_busy_guard_escapes_after_threshold() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-escape)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf '%s\n' "$(( $(date +%s) - 400 ))" > "$state/.subsuper-busy-guard-since"
+  (
+    LOG="$state/daemon.log"
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { PANE_BUSY_LAST_SOURCE="native agent-state (agent_status=busy)"; return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=300 \
+      inject_msg "hello" "$state" \
+      || fail "inject_msg should deliver once the busy guard has disagreed with an empty composer past the escape threshold"
+    assert_absent "$state/.subsuper-busy-guard-since" \
+      "the escape-hatch clock should reset once it has fired"
+    assert_grep "inject busy-guard override" "$LOG" \
+      "a fired escape should log that it overrode the busy guard: $(cat "$LOG" 2>/dev/null)"
+  ) || fail "busy-guard escape-after-threshold subshell failed"
+  pass "inject_msg: delivers past a stale busy verdict once the composer has read empty for the full escape threshold"
+}
+
+test_inject_msg_busy_guard_escape_disabled_by_zero() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-escape-disabled)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf '%s\n' "$(( $(date +%s) - 99999 ))" > "$state/.subsuper-busy-guard-since"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "send_text_submit must not run when FM_BUSY_GUARD_ESCAPE_SECS=0 disables the escape"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=0 \
+        inject_msg "hello" "$state"; then
+      fail "inject_msg should never escape the busy guard when FM_BUSY_GUARD_ESCAPE_SECS=0"
+    fi
+  ) || fail "busy-guard escape-disabled subshell failed"
+  pass "inject_msg: FM_BUSY_GUARD_ESCAPE_SECS=0 keeps the busy guard deferring forever, matching the pre-fix behavior"
+}
+
+# Diagnostic fix (same investigation): a successful delivery used to log
+# nothing, so a healthy away session and a wedged one looked identical in the
+# daemon log. A confirmed submit must now leave both a log line and a durable
+# last-delivery marker.
+test_inject_msg_records_last_delivery_on_success() {
+  local dir state before after marker
+  dir=$(make_supercase inject-last-delivery)
+  state="$dir/state"
+  afk_enter "$state"
+  before=$(date +%s)
+  (
+    LOG="$state/daemon.log"
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 1; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
+      || fail "inject_msg should succeed when send_text_submit confirms empty"
+    assert_grep "inject delivered" "$LOG" "a confirmed submit should log a delivery line: $(cat "$LOG" 2>/dev/null)"
+  ) || fail "last-delivery marker subshell failed"
+  after=$(date +%s)
+  assert_present "$state/.subsuper-last-delivery" "a confirmed submit should write the last-delivery marker"
+  marker=$(cat "$state/.subsuper-last-delivery")
+  case "$marker" in
+    *[!0-9]*|'') fail "last-delivery marker should be a bare epoch, got: $marker" ;;
+  esac
+  [ "$marker" -ge "$before" ] && [ "$marker" -le "$after" ] \
+    || fail "last-delivery marker $marker is not within [$before, $after]"
+  pass "inject_msg: a confirmed submit logs delivery and writes state/.subsuper-last-delivery"
 }
 
 test_inject_msg_herdr_composer_guard_defers() {
@@ -2026,3 +2132,7 @@ test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch
 test_inject_msg_defers_on_dead_shell_unknown
 test_inject_msg_defers_on_unrecognized_composer_state
+test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold
+test_inject_msg_busy_guard_escapes_after_threshold
+test_inject_msg_busy_guard_escape_disabled_by_zero
+test_inject_msg_records_last_delivery_on_success

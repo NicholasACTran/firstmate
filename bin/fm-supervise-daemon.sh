@@ -53,7 +53,12 @@
 #     Buffered escalation delivery also has a max-defer alarm: if a digest stays
 #     undelivered past FM_MAX_DEFER_SECS, the daemon retries a normal flush and
 #     writes state/.subsuper-inject-wedged and attempts a configurable active
-#     alert if submit still cannot be confirmed.
+#     alert if submit still cannot be confirmed. That retry re-enters the same
+#     busy guard, so inject_msg also carries its own bounded escape: once the
+#     busy guard has disagreed with a confirmed-empty composer for
+#     FM_BUSY_GUARD_ESCAPE_SECS straight, it delivers instead of deferring
+#     again, bounding any guard false-positive to that window instead of the
+#     whole away session.
 #   - Cheap heartbeat catch-all: every HEARTBEAT_SCAN_SECS the daemon greps all
 #     state/*.status for a captain-relevant line the per-wake classifier might
 #     have missed (e.g. a status verb outside CAPTAIN_RE) and escalates it.
@@ -108,6 +113,12 @@
 #                                   undelivered before one normal flush attempt;
 #                                   if that cannot confirm a submit, a wedge
 #                                   alarm fires (default 300; 0 disables)
+#          FM_BUSY_GUARD_ESCAPE_SECS max seconds the busy guard may keep
+#                                   deferring while the composer reads
+#                                   provably empty before inject_msg stops
+#                                   trusting the busy verdict and delivers
+#                                   anyway (default 300; 0 disables the escape,
+#                                   so a busy verdict always defers as before)
 #          FM_WEDGE_ALARM_CHANNEL   override config/wedge-alarm with a single
 #                                   active-alert directive for that wedge alarm
 #                                   (off|auto|osascript|herdr|command:<cmd>). An
@@ -201,6 +212,13 @@ HOUSEKEEPING_TICK_DEFAULT=15
 # the normal flush path and, if that cannot confirm a submit, raises a loud wedge
 # alarm. The escape hatch makes a guard false-positive visible instead of silent.
 MAX_DEFER_SECS_DEFAULT=300
+# How long the busy guard may disagree with a provably-empty composer before
+# inject_msg stops trusting it and delivers anyway (2026-08-26 investigation:
+# the daemon's own in-pane launch method can make an idle claude pane read
+# permanently busy, and the max-defer retry above re-enters this same guard,
+# so a false positive here was previously unbounded). Set to 0 to disable the
+# escape and always defer on a busy verdict, matching the old behavior.
+BUSY_GUARD_ESCAPE_SECS_DEFAULT=300
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
@@ -588,16 +606,26 @@ fm_daemon_primary_harness() {
   printf '%s' "$FM_DAEMON_PRIMARY_HARNESS"
 }
 
+# Sets the global PANE_BUSY_LAST_SOURCE as a side effect on a busy verdict, so
+# a caller logging a deferral can say which branch decided (native agent-state
+# vs the rendered-pane regex fallback) instead of one indistinguishable line
+# for both - the 2026-08-26 investigation had to read a private herdr ruleset
+# and reproduce a footer live just to answer that question from the log alone.
 pane_is_busy() {  # <target> [backend]
   local target=$1 backend=${2:-tmux} native tail40 harness
   harness=$(fm_daemon_primary_harness)
+  PANE_BUSY_LAST_SOURCE=
   native=$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)
   case "$native" in
-    busy) return 0 ;;
+    busy) PANE_BUSY_LAST_SOURCE="native agent-state (agent_status=busy)"; return 0 ;;
   esac
   tail40=$(fm_backend_capture "$backend" "$target" 40 2>/dev/null) || return 1
-  printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -12 \
-    | fm_busy_lines_match "$harness"
+  if printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -12 \
+    | fm_busy_lines_match "$harness"; then
+    PANE_BUSY_LAST_SOURCE="rendered-pane busy-regex fallback"
+    return 0
+  fi
+  return 1
 }
 
 # pane_input_pending dispatches through fm_backend_composer_state and treats
@@ -1127,7 +1155,8 @@ window_for_task() {  # <task-key> [state]
 #     line, or a previous injection's unsent text), defer entirely - injecting
 #     would merge with the human's text.
 inject_msg() {  # <message> [state]
-  local msg=$1 state target backend retries sleep_s verdict composer encoded
+  local msg=$1 state target backend retries sleep_s verdict composer encoded \
+        since_file since now age escape_secs
   state="${2:-$(_state_root)}"
   # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
   # daemon self-handles and stays quiet; firstmate drives the normal always-on
@@ -1148,10 +1177,45 @@ inject_msg() {  # <message> [state]
   # discovery), matching this function's pre-existing default assumption.
   backend="${FM_SUPERVISOR_BACKEND:-tmux}"
   fm_backend_target_exists "$backend" "$target" || return 1
-  # (3) Busy-guard: never inject into an in-use supervisor pane.
+  since_file="$state/.subsuper-busy-guard-since"
+  # (3) Busy-guard: never inject into an in-use supervisor pane, with one
+  # bounded escape. A busy verdict (native or regex-fallback) that persists
+  # while the composer below reads provably empty is the exact false-positive
+  # this daemon can itself cause (2026-08-26 investigation: launching the
+  # daemon as an in-pane background job makes an idle claude pane's footer
+  # read permanently busy to herdr), and the max-defer retry above re-enters
+  # this same guard, so an unbounded silence was possible. The composer read
+  # is the accurate signal - it reads the actual input area and has never once
+  # been the deferring guard across six observed runs - so once the busy
+  # guard has disagreed with a confirmed-empty composer for
+  # FM_BUSY_GUARD_ESCAPE_SECS straight, delivering is safer than deferring
+  # again. Only an exact 'empty' composer read counts: pending, unknown, and a
+  # bare dead-shell prompt still defer with no escape.
   if pane_is_busy "$target" "$backend"; then
-    log "inject deferred: supervisor pane busy (agent mid-turn)"
-    return 1
+    composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
+    if [ "$composer" != empty ]; then
+      rm -f "$since_file"
+      log "inject deferred: supervisor pane busy (${PANE_BUSY_LAST_SOURCE:-agent mid-turn})"
+      return 1
+    fi
+    now=$(_now)
+    since=$(cat "$since_file" 2>/dev/null || true)
+    case "$since" in
+      ''|*[!0-9]*) since=$now; printf '%s\n' "$since" > "$since_file" 2>/dev/null || true ;;
+    esac
+    age=$((now - since))
+    escape_secs=${FM_BUSY_GUARD_ESCAPE_SECS:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT}
+    if [ "$escape_secs" -gt 0 ] && [ "$age" -ge "$escape_secs" ]; then
+      log "inject busy-guard override: ${PANE_BUSY_LAST_SOURCE:-native agent-state} read busy for ${age}s straight while the composer stayed provably empty; delivering instead of deferring further"
+      rm -f "$since_file"
+      # Fall through: composer confirmed empty, so the guard below re-checks
+      # it once more immediately before typing and the submit proceeds.
+    else
+      log "inject deferred: supervisor pane busy (${PANE_BUSY_LAST_SOURCE:-agent mid-turn}); composer confirmed-empty for ${age}s, escapes at ${escape_secs}s"
+      return 1
+    fi
+  else
+    rm -f "$since_file"
   fi
   #   b) Composer-guard: inject ONLY into a confirmed-empty GENUINE agent
   #      composer. The shared classifier (fm_backend_composer_state ->
@@ -1178,6 +1242,12 @@ inject_msg() {  # <message> [state]
   sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
   verdict=$(fm_backend_send_text_submit "$backend" "$target" "$msg" "$retries" "$sleep_s" "$sleep_s")
   if [ "$verdict" = empty ]; then
+    # Durable positive record: without this a successful delivery and a run
+    # that never had anything to deliver look identical in the log (the prior
+    # silent `return 0` recorded only failures), so there was no way to tell
+    # when away mode had last actually worked short of return-time reading.
+    printf '%s\n' "$(_now)" > "$state/.subsuper-last-delivery" 2>/dev/null || true
+    log "inject delivered: escalation submitted (verdict=empty)"
     return 0  # Backend confirmed the submit.
   fi
   log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
