@@ -2078,6 +2078,61 @@ test_inject_msg_busy_guard_streak_resets_when_pane_stops_reading_busy() {
   pass "inject_msg: a non-busy verdict resets the busy+empty streak"
 }
 
+# Regression for streak-marker-survives-early-returns: the marker records
+# OBSERVED continuity, not wall-clock since it was first written. inject_msg
+# has three early returns that end a tick without ever observing the pane
+# (afk inactive, an unencodable payload, a supervisor pane that no longer
+# exists), and each must break the streak. Concrete failure this reproduces:
+# a streak starts, the supervisor pane is closed and recreated for several
+# minutes (fm_backend_target_exists false), and then an agent GENUINELY starts
+# a turn - busy plus an empty composer, the normal state of a correctly working
+# agent - and the very first observation escapes on a marker aged past the
+# threshold with zero observed seconds of disagreement.
+test_inject_msg_busy_guard_streak_resets_on_unobserved_ticks() {
+  local dir state case_name
+  for case_name in afk-inactive unencodable-payload target-gone; do
+    dir=$(make_supercase "inject-busy-guard-streak-unobserved-$case_name")
+    state="$dir/state"
+    afk_enter "$state"
+    mkdir -p "$state"
+    printf 'digest item\n' > "$state/.subsuper-escalations"
+    _now > "$state/.subsuper-escalations.since"
+    : > "$state/$STREAK_MARKER_NAME"
+    backdate_mtime "$state/$STREAK_MARKER_NAME" 299
+    (
+      FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+      fm_backend_target_exists() { [ "$case_name" != target-gone ]; }
+      pane_is_busy() { fail "an early return must not reach the busy guard"; }
+      fm_backend_composer_state() { fail "an early return must not reach the composer guard"; }
+      fm_backend_send_text_submit() { fail "an early return must never submit"; }
+      case "$case_name" in
+        afk-inactive) rm -f "$state/$AFK_FLAG_NAME" ;;
+        unencodable-payload) fm_operational_input_encode() { return 1; } ;;
+      esac
+      if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+        fail "inject_msg should have returned early for case '$case_name'"
+      fi
+    ) || fail "unobserved-tick subshell failed for case '$case_name'"
+    assert_absent "$state/$STREAK_MARKER_NAME" \
+      "a tick that returned early ('$case_name') without observing the pane left the streak accruing"
+
+    # And the streak must genuinely start over: a later busy+empty observation
+    # defers instead of inheriting the discarded 299s.
+    afk_enter "$state"
+    (
+      FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+      fm_backend_target_exists() { return 0; }
+      pane_is_busy() { return 0; }
+      fm_backend_composer_state() { printf 'empty'; }
+      fm_backend_send_text_submit() { fail "a streak broken by an unobserved tick ('$case_name') must not resume where it left off"; }
+      if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+        fail "inject_msg escaped on time accrued across an unobserved gap ('$case_name')"
+      fi
+    ) || fail "post-unobserved-gap subshell failed for case '$case_name'"
+  done
+  pass "inject_msg: an early return that never observes the pane breaks the busy+empty streak, so unobserved time cannot accrue toward the escape"
+}
+
 # Fail-closed: a marker that cannot be created or stat'd must read as age 0
 # (keep deferring), never as _file_age's "missing = 999999" sentinel. Treating
 # an unknown age as maximally old would bypass the entire window on the very
@@ -2219,7 +2274,7 @@ test_resolve_busy_guard_escape_secs_invalid_falls_back_and_logs() {
   # shell convention, not an invalid-input case.
   for raw in not-a-number -5; do
     (
-      LOG="$TMP_ROOT/invalid-$$.log"
+      LOG="$TMP_ROOT/invalid-${raw//[^A-Za-z0-9]/_}.log"
       FM_BUSY_GUARD_ESCAPE_SECS="$raw"
       resolve_busy_guard_escape_secs
       [ "$BUSY_GUARD_ESCAPE_SECS_RESOLVED" = "$BUSY_GUARD_ESCAPE_SECS_DEFAULT" ] \
@@ -2465,6 +2520,7 @@ test_inject_msg_busy_guard_escape_one_second_short_still_defers
 test_inject_msg_busy_guard_escape_disabled_by_zero
 test_inject_msg_busy_guard_streak_resets_when_composer_stops_reading_empty
 test_inject_msg_busy_guard_streak_resets_when_pane_stops_reading_busy
+test_inject_msg_busy_guard_streak_resets_on_unobserved_ticks
 test_inject_msg_busy_guard_streak_marker_uncreatable_fails_closed
 test_inject_msg_busy_guard_restart_does_not_reset_deadline
 test_resolve_busy_guard_escape_secs_valid_and_leading_zero_values

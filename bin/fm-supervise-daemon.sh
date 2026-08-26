@@ -1214,16 +1214,32 @@ inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer encoded \
         streak_marker streak_age streak_mtime escape_secs escape_fired
   state="${2:-$(_state_root)}"
+  # The busy-guard escape below measures a CONTINUOUS run of observed
+  # busy-verdict-plus-confirmed-empty-composer ticks, so its marker is resolved
+  # here, before every early return, and every path that ends without making
+  # that observation clears it. An unobserved gap (afk toggled off, an
+  # unencodable payload, the supervisor pane briefly gone during a herdr
+  # restart) must not let wall-clock time accrue toward the escape threshold:
+  # the marker records observed continuity, not elapsed time since it was
+  # first written.
+  streak_marker="$state/.subsuper-busy-empty-streak-since"
   # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
   # daemon self-handles and stays quiet; firstmate drives the normal always-on
   # watcher triage. Escalations buffer and survive for the next catch-up flush.
-  afk_active "$state" || { log "inject deferred: afk inactive"; return 1; }
+  afk_active "$state" || {
+    rm -f "$streak_marker" 2>/dev/null || true
+    log "inject deferred: afk inactive"
+    return 1
+  }
   # (2) Single-line digest: collapse any embedded newlines so submission via
   # send-keys + Enter is unambiguous regardless of how the TUI composer treats
   # them. Then use the canonical typed envelope so downstream consumers retain
   # the exact away-supervisor kind without interpreting this payload's prose.
   msg=$(_collapse_newlines "$msg")
-  fm_operational_input_encode away-supervisor "$msg" encoded || return 1
+  fm_operational_input_encode away-supervisor "$msg" encoded || {
+    rm -f "$streak_marker" 2>/dev/null || true
+    return 1
+  }
   msg=$encoded
   target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
   # BACKEND-AWARE (previously a raw `tmux display-message` pane-exists probe):
@@ -1232,7 +1248,10 @@ inject_msg() {  # <message> [state]
   # when unset (sourced/test contexts that never ran fm_super_main's startup
   # discovery), matching this function's pre-existing default assumption.
   backend="${FM_SUPERVISOR_BACKEND:-tmux}"
-  fm_backend_target_exists "$backend" "$target" || return 1
+  fm_backend_target_exists "$backend" "$target" || {
+    rm -f "$streak_marker" 2>/dev/null || true
+    return 1
+  }
   # (3) Busy-guard: never inject into an in-use supervisor pane, with one
   # bounded escape. A busy verdict (native or regex-fallback) that persists
   # while the composer below reads provably empty is the exact false-positive
@@ -1273,7 +1292,6 @@ inject_msg() {  # <message> [state]
   # absent marker must never read as infinitely old -
   # that would bypass the entire window on the first attempt, which is the
   # bound's whole purpose.
-  streak_marker="$state/.subsuper-busy-empty-streak-since"
   escape_fired=0
   if pane_is_busy "$target" "$backend"; then
     composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
