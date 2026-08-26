@@ -1156,7 +1156,7 @@ window_for_task() {  # <task-key> [state]
 #     would merge with the human's text.
 inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer encoded \
-        since_file since now age escape_secs
+        since_file since since_valid afk_started now age escape_secs escape_secs_raw
   state="${2:-$(_state_root)}"
   # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
   # daemon self-handles and stays quiet; firstmate drives the normal always-on
@@ -1200,11 +1200,39 @@ inject_msg() {  # <message> [state]
     fi
     now=$(_now)
     since=$(cat "$since_file" 2>/dev/null || true)
-    case "$since" in
-      ''|*[!0-9]*) since=$now; printf '%s\n' "$since" > "$since_file" 2>/dev/null || true ;;
-    esac
+    # A leftover marker from a PRIOR away session must never satisfy the
+    # threshold on this session's very first busy+empty observation - that is
+    # exactly the "guard state outlives the run it measured" failure this
+    # ticket exists to prevent. afk_enter stamps state/.afk with the epoch
+    # this away session began, so a marker older than that stamp (or simply
+    # absent or non-numeric) is stale and gets reset to "now" instead of
+    # trusted.
+    afk_started=$(cat "$state/$AFK_FLAG_NAME" 2>/dev/null || true)
+    since_valid=1
+    case "$since" in ''|*[!0-9]*) since_valid=0 ;; esac
+    if [ "$since_valid" -eq 1 ]; then
+      case "$afk_started" in
+        ''|*[!0-9]*) : ;; # can't corroborate against this session's start; trust the marker as-is
+        *) [ "$since" -ge "$afk_started" ] || since_valid=0 ;;
+      esac
+    fi
+    if [ "$since_valid" -eq 0 ]; then
+      since=$now
+      printf '%s\n' "$since" > "$since_file" 2>/dev/null || true
+    fi
     age=$((now - since))
-    escape_secs=${FM_BUSY_GUARD_ESCAPE_SECS:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT}
+    # FM_BUSY_GUARD_ESCAPE_SECS: 0 (and only 0) disables the escape; a
+    # positive integer sets the interval; anything else (blank, non-numeric,
+    # negative) is refused loudly and the default is used instead - never a
+    # silent, permanent disable.
+    escape_secs_raw=${FM_BUSY_GUARD_ESCAPE_SECS:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT}
+    case "$escape_secs_raw" in
+      0) escape_secs=0 ;;
+      ''|*[!0-9]*)
+        log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='${escape_secs_raw}' is not zero or a positive integer; refusing it and using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
+        escape_secs=$BUSY_GUARD_ESCAPE_SECS_DEFAULT ;;
+      *) escape_secs=$escape_secs_raw ;;
+    esac
     if [ "$escape_secs" -gt 0 ] && [ "$age" -ge "$escape_secs" ]; then
       log "inject busy-guard override: ${PANE_BUSY_LAST_SOURCE:-native agent-state} read busy for ${age}s straight while the composer stayed provably empty; delivering instead of deferring further"
       rm -f "$since_file"

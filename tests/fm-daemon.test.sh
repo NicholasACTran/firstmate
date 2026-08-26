@@ -1866,8 +1866,11 @@ test_inject_msg_busy_guard_escapes_after_threshold() {
   local dir state
   dir=$(make_supercase inject-busy-guard-escape)
   state="$dir/state"
-  afk_enter "$state"
   mkdir -p "$state"
+  # This away session started well before the busy+empty-composer streak did,
+  # so the streak marker is legitimately old relative to THIS run, not a
+  # leftover from a previous one.
+  printf '%s\n' "$(( $(date +%s) - 1000 ))" > "$state/.afk"
   printf '%s\n' "$(( $(date +%s) - 400 ))" > "$state/.subsuper-busy-guard-since"
   (
     LOG="$state/daemon.log"
@@ -1890,8 +1893,8 @@ test_inject_msg_busy_guard_escape_disabled_by_zero() {
   local dir state
   dir=$(make_supercase inject-busy-guard-escape-disabled)
   state="$dir/state"
-  afk_enter "$state"
   mkdir -p "$state"
+  printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$state/.afk"
   printf '%s\n' "$(( $(date +%s) - 99999 ))" > "$state/.subsuper-busy-guard-since"
   (
     fm_backend_target_exists() { return 0; }
@@ -1904,6 +1907,87 @@ test_inject_msg_busy_guard_escape_disabled_by_zero() {
     fi
   ) || fail "busy-guard escape-disabled subshell failed"
   pass "inject_msg: FM_BUSY_GUARD_ESCAPE_SECS=0 keeps the busy guard deferring forever, matching the pre-fix behavior"
+}
+
+# Review fix (P1, PR #3090): a busy-guard-since marker left over from a PRIOR
+# away session must NOT satisfy the escape threshold on THIS session's very
+# first busy+empty observation. Without the fix this test fails: a leftover
+# marker from long before the current away session started would read as
+# already-overdue and inject_msg would deliver immediately into what could be
+# an active supervisor turn, instead of waiting out the interval.
+test_inject_msg_busy_guard_stale_marker_from_prior_session_does_not_escape() {
+  local dir state since_after afk_started
+  dir=$(make_supercase inject-busy-guard-stale-marker)
+  state="$dir/state"
+  afk_enter "$state"  # this session's .afk starts "now"
+  mkdir -p "$state"
+  # A marker left behind by a much earlier away session - far older than
+  # FM_BUSY_GUARD_ESCAPE_SECS, and older than THIS session's .afk stamp.
+  printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$state/.subsuper-busy-guard-since"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "a stale cross-session marker must not be honored as already-overdue"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=300 \
+        inject_msg "hello" "$state"; then
+      fail "inject_msg must not escape on a stale marker inherited from a prior away session"
+    fi
+  ) || fail "stale cross-session marker subshell failed"
+  since_after=$(cat "$state/.subsuper-busy-guard-since" 2>/dev/null || echo '')
+  case "$since_after" in
+    ''|*[!0-9]*) fail "the stale marker should have been rewritten to a fresh numeric epoch, got: $since_after" ;;
+  esac
+  afk_started=$(cat "$state/.afk")
+  [ "$since_after" -ge "$afk_started" ] \
+    || fail "the rewritten marker ($since_after) should not predate this session's .afk stamp ($afk_started)"
+  pass "inject_msg: a busy-guard-since marker inherited from a prior away session is treated as stale, not as already-overdue"
+}
+
+# Review fix (P2, PR #3090): FM_BUSY_GUARD_ESCAPE_SECS's contract is "zero and
+# only zero disables the escape". A non-numeric or negative value must be
+# refused loudly with the default applied, never silently disable the escape
+# forever (and never throw a bare integer-expression error either).
+test_inject_msg_busy_guard_escape_secs_invalid_value_falls_back_and_logs() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-escape-secs-invalid)
+  state="$dir/state"
+  mkdir -p "$state"
+  printf '%s\n' "$(( $(date +%s) - 1000 ))" > "$state/.afk"
+  # Already past the DEFAULT (300s) threshold, so a correct fallback escapes.
+  printf '%s\n' "$(( $(date +%s) - 400 ))" > "$state/.subsuper-busy-guard-since"
+  (
+    LOG="$state/daemon.log"
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=not-a-number \
+      inject_msg "hello" "$state" \
+      || fail "inject_msg should fall back to the default escape interval on a non-numeric override, not disable the escape"
+    assert_grep "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='not-a-number' is not zero or a positive integer" "$LOG" \
+      "an invalid override should be refused loudly: $(cat "$LOG" 2>/dev/null)"
+  ) || fail "invalid FM_BUSY_GUARD_ESCAPE_SECS subshell failed"
+  pass "inject_msg: a non-numeric FM_BUSY_GUARD_ESCAPE_SECS is refused loudly and falls back to the default instead of silently disabling the escape"
+}
+
+test_inject_msg_busy_guard_escape_secs_negative_value_falls_back() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-escape-secs-negative)
+  state="$dir/state"
+  mkdir -p "$state"
+  printf '%s\n' "$(( $(date +%s) - 1000 ))" > "$state/.afk"
+  printf '%s\n' "$(( $(date +%s) - 400 ))" > "$state/.subsuper-busy-guard-since"
+  (
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=-5 \
+      inject_msg "hello" "$state" \
+      || fail "a negative FM_BUSY_GUARD_ESCAPE_SECS should fall back to the default and still escape, not disable forever"
+  ) || fail "negative FM_BUSY_GUARD_ESCAPE_SECS subshell failed"
+  pass "inject_msg: a negative FM_BUSY_GUARD_ESCAPE_SECS is refused and falls back to the default"
 }
 
 # Diagnostic fix (same investigation): a successful delivery used to log
@@ -2135,4 +2219,7 @@ test_inject_msg_defers_on_unrecognized_composer_state
 test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold
 test_inject_msg_busy_guard_escapes_after_threshold
 test_inject_msg_busy_guard_escape_disabled_by_zero
+test_inject_msg_busy_guard_stale_marker_from_prior_session_does_not_escape
+test_inject_msg_busy_guard_escape_secs_invalid_value_falls_back_and_logs
+test_inject_msg_busy_guard_escape_secs_negative_value_falls_back
 test_inject_msg_records_last_delivery_on_success
