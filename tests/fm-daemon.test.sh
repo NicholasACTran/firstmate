@@ -1830,78 +1830,86 @@ test_inject_msg_herdr_busy_guard_defers() {
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
       fail "inject_msg should defer (return non-zero) when the herdr supervisor pane is busy"
     fi
-    [ -z "${BUSY_GUARD_SINCE_EPOCH:-}" ] \
-      || fail "no in-process escape clock should start while the composer is not confirmed empty"
   ) || fail "herdr busy-guard inject_msg subshell failed"
   pass "inject_msg: herdr busy-guard defers before ever attempting a submit"
 }
 
-# Bounding fix (firstmate-afk-daemon-wedged-investigation, 2026-08-26): a busy
-# verdict paired with a PROVABLY EMPTY composer is the exact false-positive the
-# daemon's own in-pane launch method can cause, and the max-defer retry used to
-# re-enter this same guard forever. inject_msg now starts a durable clock the
-# first time it sees busy+empty-composer together and keeps deferring - never
-# submitting on this path alone - until FM_BUSY_GUARD_ESCAPE_SECS has elapsed.
+# Bounding fix (firstmate-afk-daemon-wedged-investigation, 2026-08-26; redesigned
+# per review round 6): a busy verdict paired with a PROVABLY EMPTY composer is
+# the exact false-positive the daemon's own in-pane launch method can cause,
+# and the max-defer retry used to re-enter this same guard forever. inject_msg
+# now measures how long THIS escalation has been undelivered via the existing
+# durable state/.subsuper-escalations.since (already maintained by
+# escalate_add/escalate_flush for FM_MAX_DEFER_SECS) rather than a clock of its
+# own, and keeps deferring - never submitting on this path alone - until
+# FM_BUSY_GUARD_ESCAPE_SECS has elapsed since that escalation arrived.
 test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold() {
   local dir state
   dir=$(make_supercase inject-busy-empty-composer-early)
   state="$dir/state"
   afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  _now > "$state/.subsuper-escalations.since"  # just arrived
   (
-    BUSY_GUARD_SINCE_EPOCH=
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
     pane_is_busy() { PANE_BUSY_LAST_SOURCE="native agent-state (agent_status=busy)"; return 0; }
     fm_backend_composer_state() { printf 'empty'; }
     fm_backend_send_text_submit() { fail "send_text_submit must not run before the escape threshold elapses"; }
-    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
-      fail "inject_msg should still defer on the first busy+empty-composer observation"
+      fail "inject_msg should still defer on a just-arrived escalation"
     fi
-    [ -n "$BUSY_GUARD_SINCE_EPOCH" ] \
-      || fail "the first busy+empty-composer observation should start the in-process escape clock"
   ) || fail "busy+empty-composer pre-escape subshell failed"
   pass "inject_msg: busy verdict with a confirmed-empty composer still defers until the escape threshold elapses"
 }
 
-# Review fix (redesign, PR #3090 round 4): the escape clock now lives in the
-# daemon PROCESS (a plain variable), not on disk, so it cannot outlive a
-# restart or be inherited from a prior away session. This drives fake elapsed
-# time through the shared `_now` stub (never a real sleep) across two calls in
-# ONE subshell - the same in-process continuity a real daemon has across
-# housekeeping ticks.
+# Review fix (redesign, PR #3090 round 6): the escape is anchored to the
+# escalation's own durable arrival time (state/.subsuper-escalations.since),
+# not a clock inject_msg maintains itself, so it needs no _now stubbing here -
+# real file timestamps in the past are enough.
 test_inject_msg_busy_guard_escapes_after_threshold() {
   local dir state
   dir=$(make_supercase inject-busy-guard-escape)
   state="$dir/state"
   afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  printf '%s\n' "$(( $(date +%s) - 300 ))" > "$state/.subsuper-escalations.since"
   (
     LOG="$state/daemon.log"
-    BUSY_GUARD_SINCE_EPOCH=
     FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
     pane_is_busy() { PANE_BUSY_LAST_SOURCE="native agent-state (agent_status=busy)"; return 0; }
     fm_backend_composer_state() { printf 'empty'; }
-
-    _now() { printf '1000'; }
-    fm_backend_send_text_submit() { fail "must not escape on the first busy+empty observation"; }
-    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
-      fail "inject_msg should defer on the first observation (age 0)"
-    fi
-
-    _now() { printf '1299'; }  # 299s elapsed: still one second short
-    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
-      fail "inject_msg should still defer one second before the escape threshold"
-    fi
-
-    _now() { printf '1300'; }  # 300s elapsed: exactly at the threshold
     fm_backend_send_text_submit() { printf 'empty'; }
     FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
-      || fail "inject_msg should deliver once the busy guard has disagreed with an empty composer for the full escape threshold"
-    [ -z "$BUSY_GUARD_SINCE_EPOCH" ] || fail "the escape clock should reset once it has fired"
+      || fail "inject_msg should deliver once this escalation has gone undelivered for the full escape threshold"
     assert_grep "inject busy-guard override" "$LOG" \
       "a fired escape should log that it overrode the busy guard: $(cat "$LOG" 2>/dev/null)"
   ) || fail "busy-guard escape-after-threshold subshell failed"
-  pass "inject_msg: delivers past a stale busy verdict once the composer has read empty for the full escape threshold"
+  pass "inject_msg: delivers past a stale busy verdict once this escalation has gone undelivered for the full escape threshold"
+}
+
+test_inject_msg_busy_guard_escape_one_second_short_still_defers() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-escape-short)
+  state="$dir/state"
+  afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  printf '%s\n' "$(( $(date +%s) - 299 ))" > "$state/.subsuper-escalations.since"
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "must not escape one second before the threshold"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg should still defer one second before the escape threshold"
+    fi
+  ) || fail "one-second-short subshell failed"
+  pass "inject_msg: still defers one second before the escape threshold"
 }
 
 test_inject_msg_busy_guard_escape_disabled_by_zero() {
@@ -1909,71 +1917,70 @@ test_inject_msg_busy_guard_escape_disabled_by_zero() {
   dir=$(make_supercase inject-busy-guard-escape-disabled)
   state="$dir/state"
   afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  printf '%s\n' "$(( $(date +%s) - 999999 ))" > "$state/.subsuper-escalations.since"
   (
-    BUSY_GUARD_SINCE_EPOCH=
     FM_BUSY_GUARD_ESCAPE_SECS=0 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
     pane_is_busy() { return 0; }
     fm_backend_composer_state() { printf 'empty'; }
     fm_backend_send_text_submit() { fail "send_text_submit must not run when FM_BUSY_GUARD_ESCAPE_SECS=0 disables the escape"; }
-    _now() { printf '1000'; }
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
-      fail "inject_msg should defer on the first observation"
-    fi
-    _now() { printf '9999999'; }  # an enormous elapsed time; still must never escape
-    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
-      fail "inject_msg should never escape the busy guard when FM_BUSY_GUARD_ESCAPE_SECS=0"
+      fail "inject_msg should never escape the busy guard when FM_BUSY_GUARD_ESCAPE_SECS=0, no matter how long undelivered"
     fi
   ) || fail "busy-guard escape-disabled subshell failed"
   pass "inject_msg: FM_BUSY_GUARD_ESCAPE_SECS=0 keeps the busy guard deferring forever, matching the pre-fix behavior"
 }
 
-# Review fix (redesign, PR #3090 round 4): a daemon restart is a new PROCESS,
-# so the escape clock - a plain variable - starts fresh automatically; there
-# is no durable marker left to inherit or corroborate. This test simulates
-# "restart" the only way that is meaningful for an in-process variable: a
-# fresh subshell (this test's own) never sees the BUSY_GUARD_SINCE_EPOCH a
-# DIFFERENT subshell advanced, because bash subshells never write state back
-# to their parent - so the very next busy+empty observation in a new subshell
-# must start counting from zero, not resume some inherited streak.
-test_inject_msg_busy_guard_restart_gets_a_fresh_clock() {
+# Review fix (redesign, PR #3090 round 6): Greptile found a real hole in the
+# in-process-clock version of this fix - the daemon has a crash-loop guard, so
+# restarts are a real, expected event, and a persistent busy false-positive
+# combined with repeated restarts reset an in-process clock every time,
+# deferring forever. The escape is now anchored to
+# state/.subsuper-escalations.since, which is tied to live undelivered work
+# (created when an escalation lands in an empty buffer, removed on successful
+# delivery), not to the daemon process's lifetime - so a restart cannot reset
+# it. This test asserts the PROPERTY across two entirely separate subshells
+# (no shared bash state between them, only the durable file) and would FAIL
+# against the in-process-clock version: that version's fresh subshell would
+# see age 0 and defer, instead of correctly escaping.
+test_inject_msg_busy_guard_restart_does_not_reset_deadline() {
   local dir state
-  dir=$(make_supercase inject-busy-guard-restart)
+  dir=$(make_supercase inject-busy-guard-restart-deadline)
   state="$dir/state"
   afk_enter "$state"
+  mkdir -p "$state"
+  printf 'digest item\n' > "$state/.subsuper-escalations"
+  printf '%s\n' "$(( $(date +%s) - 1 ))" > "$state/.subsuper-escalations.since"  # arrived ~1s ago
 
-  # "Prior away session": advance the clock to just one second under its
-  # escape threshold, entirely inside its own subshell.
+  # "First daemon process": not yet due (escape_secs=3, only ~1s elapsed).
   (
-    BUSY_GUARD_SINCE_EPOCH=
-    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    FM_BUSY_GUARD_ESCAPE_SECS=3 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
     pane_is_busy() { return 0; }
     fm_backend_composer_state() { printf 'empty'; }
-    fm_backend_send_text_submit() { fail "must not escape yet"; }
-    _now() { printf '1000'; }
-    inject_msg "hello" "$state" >/dev/null 2>&1
-    _now() { printf '1299'; }
-    inject_msg "hello" "$state" >/dev/null 2>&1
-    true  # both calls above are expected defers (non-zero); do not let that leak as this subshell's own exit status
-  ) || fail "prior-session simulation subshell failed"
-
-  # "New away session, new daemon process": a fresh subshell, at the SAME
-  # wall-clock instant the prior one left off. If the clock survived (the bug
-  # this test guards against), this would escape immediately.
-  (
-    BUSY_GUARD_SINCE_EPOCH=
-    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
-    fm_backend_target_exists() { return 0; }
-    pane_is_busy() { return 0; }
-    fm_backend_composer_state() { printf 'empty'; }
-    fm_backend_send_text_submit() { fail "a fresh process must not inherit a prior process's escape clock"; }
-    _now() { printf '1299'; }
+    fm_backend_send_text_submit() { fail "must not escape yet - only ~1s of a 3s threshold has elapsed"; }
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
-      fail "a fresh process's first observation must defer, not escape immediately"
+      fail "inject_msg should still defer before the threshold"
     fi
-  ) || fail "fresh-process subshell failed"
-  pass "inject_msg: a daemon restart (a new process) gets a fresh escape clock, never inheriting a prior run's elapsed time"
+  ) || fail "pre-restart subshell failed"
+
+  sleep 2.5
+
+  # "Daemon restarted": a completely separate subshell sharing no bash
+  # variables with the one above - only the durable .subsuper-escalations.since
+  # file on disk. The SAME escalation has now been undelivered for >3s.
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS=3 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { printf 'empty'; }
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
+      || fail "a fresh process must still see this escalation as overdue - a restart must not reset the deadline"
+  ) || fail "post-restart subshell failed"
+  pass "inject_msg: a daemon restart does not reset the busy-guard escape deadline - it is anchored to the escalation's own durable arrival time, not a process-local clock"
 }
 
 # Review fix (redesign, PR #3090 round 4): FM_BUSY_GUARD_ESCAPE_SECS is now
@@ -2279,8 +2286,9 @@ test_inject_msg_defers_on_dead_shell_unknown
 test_inject_msg_defers_on_unrecognized_composer_state
 test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold
 test_inject_msg_busy_guard_escapes_after_threshold
+test_inject_msg_busy_guard_escape_one_second_short_still_defers
 test_inject_msg_busy_guard_escape_disabled_by_zero
-test_inject_msg_busy_guard_restart_gets_a_fresh_clock
+test_inject_msg_busy_guard_restart_does_not_reset_deadline
 test_resolve_busy_guard_escape_secs_valid_and_leading_zero_values
 test_resolve_busy_guard_escape_secs_clamp_boundary
 test_resolve_busy_guard_escape_secs_invalid_falls_back_and_logs

@@ -230,10 +230,6 @@ BUSY_GUARD_ESCAPE_SECS_MAX=86400
 # Resolved once at daemon start by resolve_busy_guard_escape_secs (below);
 # empty until then, in which case inject_msg falls back to the default.
 BUSY_GUARD_ESCAPE_SECS_RESOLVED=
-# In-process elapsed clock for the busy-guard escape in inject_msg: empty
-# means no busy+empty-composer streak is currently being timed. Deliberately
-# a plain variable, not a durable file - see inject_msg's busy-guard comment.
-BUSY_GUARD_SINCE_EPOCH=
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
@@ -1216,7 +1212,7 @@ resolve_busy_guard_escape_secs() {
 #     would merge with the human's text.
 inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer encoded \
-        now age escape_secs
+        age escape_secs
   state="${2:-$(_state_root)}"
   # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
   # daemon self-handles and stays quiet; firstmate drives the normal always-on
@@ -1245,40 +1241,44 @@ inject_msg() {  # <message> [state]
   # read permanently busy to herdr), and the max-defer retry above re-enters
   # this same guard, so an unbounded silence was possible. The composer read
   # is the accurate signal - it reads the actual input area and has never once
-  # been the deferring guard across six observed runs - so once the busy
-  # guard has disagreed with a confirmed-empty composer for
+  # been the deferring guard across six observed runs - so once this
+  # delivery obligation has been outstanding for
   # BUSY_GUARD_ESCAPE_SECS_RESOLVED straight, delivering is safer than
   # deferring again. Only an exact 'empty' composer read counts: pending,
   # unknown, and a bare dead-shell prompt still defer with no escape.
   #
-  # The elapsed clock (BUSY_GUARD_SINCE_EPOCH) is an in-PROCESS global, not a
-  # durable file: inject_msg is only ever called from housekeeping and the
-  # daemon's own shutdown trap, both inside fm_super_main's single long-lived
-  # process, so a plain variable is sufficient and a daemon restart starts a
-  # fresh clock for free - it cannot inherit a stale value left by a prior
-  # away session the way a durable marker file could.
+  # The elapsed time is the age of the OLDEST buffered escalation
+  # (state/.subsuper-escalations.since, already maintained by escalate_add /
+  # escalate_flush for FM_MAX_DEFER_SECS), not a busy-guard-specific clock.
+  # That is deliberate: an in-process variable resets on every daemon
+  # restart, and the crash-loop guard above makes restarts a real, expected
+  # event, not a rare one - a persistent busy false positive combined with
+  # repeated restarts would then defer forever, which is the exact failure
+  # this ticket exists to end. The escalation's own age is tied to live
+  # undelivered work, not to the daemon process's lifetime or the away
+  # session: it is created only when an escalation lands in an empty buffer
+  # and removed the moment delivery succeeds, so a value surviving a restart
+  # is not stale data, it is an honest measurement of how long this exact
+  # escalation has genuinely gone undelivered. escalate_flush's own
+  # "[ -s "$buf" ] || return 0" guard means inject_msg is only ever reached
+  # here with a non-empty buffer, so the `.since` file is always present at
+  # this point.
   if pane_is_busy "$target" "$backend"; then
     composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
     if [ "$composer" != empty ]; then
-      BUSY_GUARD_SINCE_EPOCH=
       log "inject deferred: supervisor pane busy (${PANE_BUSY_LAST_SOURCE:-agent mid-turn})"
       return 1
     fi
-    now=$(_now)
-    [ -n "${BUSY_GUARD_SINCE_EPOCH:-}" ] || BUSY_GUARD_SINCE_EPOCH=$now
-    age=$((now - BUSY_GUARD_SINCE_EPOCH))
+    age=$(_oldest_line_age "$state/.subsuper-escalations")
     escape_secs=${BUSY_GUARD_ESCAPE_SECS_RESOLVED:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT}
     if [ "$escape_secs" -gt 0 ] && [ "$age" -ge "$escape_secs" ]; then
-      log "inject busy-guard override: ${PANE_BUSY_LAST_SOURCE:-native agent-state} read busy for ${age}s straight while the composer stayed provably empty; delivering instead of deferring further"
-      BUSY_GUARD_SINCE_EPOCH=
+      log "inject busy-guard override: ${PANE_BUSY_LAST_SOURCE:-native agent-state} read busy while this escalation has gone undelivered for ${age}s; delivering instead of deferring further"
       # Fall through: composer confirmed empty, so the guard below re-checks
       # it once more immediately before typing and the submit proceeds.
     else
-      log "inject deferred: supervisor pane busy (${PANE_BUSY_LAST_SOURCE:-agent mid-turn}); composer confirmed-empty for ${age}s, escapes at ${escape_secs}s"
+      log "inject deferred: supervisor pane busy (${PANE_BUSY_LAST_SOURCE:-agent mid-turn}); composer confirmed-empty, undelivered for ${age}s, escapes at ${escape_secs}s"
       return 1
     fi
-  else
-    BUSY_GUARD_SINCE_EPOCH=
   fi
   #   b) Composer-guard: inject ONLY into a confirmed-empty GENUINE agent
   #      composer. The shared classifier (fm_backend_composer_state ->
