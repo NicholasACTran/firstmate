@@ -1224,14 +1224,16 @@ inject_msg() {  # <message> [state]
     # FM_BUSY_GUARD_ESCAPE_SECS: 0 (and only 0) disables the escape; a
     # positive integer sets the interval; anything else (blank, non-numeric,
     # negative) is refused loudly and the default is used instead - never a
-    # silent, permanent disable.
+    # silent, permanent disable. A digit-only value is parsed with the base
+    # forced to 10 (`10#`), so a leading-zero literal like 010 reads as
+    # decimal ten - never as bash arithmetic's C-style octal (which would
+    # silently read 010 as eight and outright error on 008/009).
     escape_secs_raw=${FM_BUSY_GUARD_ESCAPE_SECS:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT}
     case "$escape_secs_raw" in
-      0) escape_secs=0 ;;
       ''|*[!0-9]*)
         log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='${escape_secs_raw}' is not zero or a positive integer; refusing it and using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
         escape_secs=$BUSY_GUARD_ESCAPE_SECS_DEFAULT ;;
-      *) escape_secs=$escape_secs_raw ;;
+      *) escape_secs=$((10#$escape_secs_raw)) ;;
     esac
     if [ "$escape_secs" -gt 0 ] && [ "$age" -ge "$escape_secs" ]; then
       log "inject busy-guard override: ${PANE_BUSY_LAST_SOURCE:-native agent-state} read busy for ${age}s straight while the composer stayed provably empty; delivering instead of deferring further"

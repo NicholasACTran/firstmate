@@ -1990,6 +1990,53 @@ test_inject_msg_busy_guard_escape_secs_negative_value_falls_back() {
   pass "inject_msg: a negative FM_BUSY_GUARD_ESCAPE_SECS is refused and falls back to the default"
 }
 
+# Review fix (P1 round 2, PR #3090): a digit-only FM_BUSY_GUARD_ESCAPE_SECS
+# with a leading zero (010, 008, 009, 007) must take effect at the DECIMAL
+# value the operator wrote, never bash arithmetic's C-style octal reading (010
+# as eight, or an outright error on 008/009). For each value this asserts the
+# EFFECTIVE interval directly - one age just under it must still defer, the
+# same age AT it must escape - rather than only checking that validation
+# accepted the string, which would pass even with the leading zero misparsed.
+test_inject_msg_busy_guard_escape_secs_leading_zero_parsed_as_decimal() {
+  local pair raw expected dir state
+  for pair in 007:7 008:8 009:9 010:10 5:5; do
+    raw=${pair%%:*}
+    expected=${pair#*:}
+
+    dir=$(make_supercase "inject-escape-secs-decimal-$raw-under")
+    state="$dir/state"
+    mkdir -p "$state"
+    printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$state/.afk"
+    printf '%s\n' "$(( $(date +%s) - (expected - 1) ))" > "$state/.subsuper-busy-guard-since"
+    (
+      fm_backend_target_exists() { return 0; }
+      pane_is_busy() { return 0; }
+      fm_backend_composer_state() { printf 'empty'; }
+      fm_backend_send_text_submit() { fail "raw='$raw' (effective ${expected}s): escaped one second early - a leading zero was misparsed as octal"; }
+      if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS="$raw" \
+          inject_msg "hello" "$state"; then
+        fail "raw='$raw': inject_msg should still defer just under its effective interval (${expected}s)"
+      fi
+    ) || fail "raw='$raw' pre-threshold subshell failed"
+
+    dir=$(make_supercase "inject-escape-secs-decimal-$raw-at")
+    state="$dir/state"
+    mkdir -p "$state"
+    printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$state/.afk"
+    printf '%s\n' "$(( $(date +%s) - expected ))" > "$state/.subsuper-busy-guard-since"
+    (
+      fm_backend_target_exists() { return 0; }
+      pane_is_busy() { return 0; }
+      fm_backend_composer_state() { printf 'empty'; }
+      fm_backend_send_text_submit() { printf 'empty'; }
+      FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS="$raw" \
+        inject_msg "hello" "$state" \
+        || fail "raw='$raw': inject_msg should escape once age reaches its effective interval (${expected}s) - got a defer, so the value was not read as decimal $expected"
+    ) || fail "raw='$raw' at-threshold subshell failed"
+  done
+  pass "inject_msg: FM_BUSY_GUARD_ESCAPE_SECS with a leading zero (007/008/009/010) takes effect at its decimal value, never bash's C-style octal reading"
+}
+
 # Diagnostic fix (same investigation): a successful delivery used to log
 # nothing, so a healthy away session and a wedged one looked identical in the
 # daemon log. A confirmed submit must now leave both a log line and a durable
@@ -2222,4 +2269,5 @@ test_inject_msg_busy_guard_escape_disabled_by_zero
 test_inject_msg_busy_guard_stale_marker_from_prior_session_does_not_escape
 test_inject_msg_busy_guard_escape_secs_invalid_value_falls_back_and_logs
 test_inject_msg_busy_guard_escape_secs_negative_value_falls_back
+test_inject_msg_busy_guard_escape_secs_leading_zero_parsed_as_decimal
 test_inject_msg_records_last_delivery_on_success
