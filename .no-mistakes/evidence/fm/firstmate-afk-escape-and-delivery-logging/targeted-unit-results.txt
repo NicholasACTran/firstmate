@@ -1,0 +1,20 @@
+ok - busy-guard defers injection when supervisor pane is busy
+ok - primary busy guard isolates rendered signatures by detected harness
+ok - inject_msg: herdr busy-guard defers before ever attempting a submit
+ok - inject_msg: the busy-guard deferral line names the branch that decided (native agent-state vs rendered-pane regex fallback)
+ok - inject_msg: dispatches busy-guard/composer-guard/submit through the herdr backend and succeeds on a confirmed empty composer
+ok - inject_msg: a long-undelivered escalation does not shorten the busy-guard escape window - only the busy+empty streak counts
+ok - inject_msg: delivers past a stale busy verdict once the busy+empty streak has run the full escape threshold
+ok - inject_msg: FM_BUSY_GUARD_ESCAPE_SECS=0 keeps the busy guard deferring forever, matching the pre-fix behavior
+ok - inject_msg: a composer verdict other than empty resets the busy+empty streak, and the next streak starts from zero
+ok - inject_msg: a non-busy verdict resets the busy+empty streak
+ok - inject_msg: an early return that never observes the pane breaks the busy+empty streak, so unobserved time cannot accrue toward the escape
+ok - inject_msg: time in which the daemon never observed the pane does not accrue toward the busy-guard escape
+ok - inject_msg: a continuously observed busy+empty streak still escapes once the observed seconds cross the threshold
+ok - resolve_busy_empty_streak_step_max: zero, non-numeric, negative, and overflow-sized cadences fall back to the default; leading zeros parse as decimal
+ok - inject_msg: an uncreatable streak marker fails closed (age 0, keep deferring) instead of reading as infinitely old
+ok - inject_msg: a daemon restart does not reset the busy-guard escape deadline - the streak lives in a durable marker, not a process-local clock
+ok - resolve_busy_guard_escape_secs: 0, a plain positive, and every leading-zero form (007/008/009/010) resolve to their decimal value
+ok - resolve_busy_guard_escape_secs: a value at the clamp is accepted, one past it falls back to the default, and a value far outside bash's integer range is rejected by safe string comparison rather than overflowing arithmetic
+ok - resolve_busy_guard_escape_secs: blank, non-numeric, and negative overrides are refused loudly and fall back to the default, never a silent permanent disable
+ok - inject_msg: a confirmed submit logs delivery and writes state/.subsuper-last-delivery
