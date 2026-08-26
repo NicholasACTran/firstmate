@@ -118,7 +118,9 @@
 #                                   provably empty before inject_msg stops
 #                                   trusting the busy verdict and delivers
 #                                   anyway (default 300; 0 disables the escape,
-#                                   so a busy verdict always defers as before)
+#                                   so a busy verdict always defers as before;
+#                                   clamped to BUSY_GUARD_ESCAPE_SECS_MAX;
+#                                   resolved once at daemon start)
 #          FM_WEDGE_ALARM_CHANNEL   override config/wedge-alarm with a single
 #                                   active-alert directive for that wedge alarm
 #                                   (off|auto|osascript|herdr|command:<cmd>). An
@@ -219,6 +221,19 @@ MAX_DEFER_SECS_DEFAULT=300
 # so a false positive here was previously unbounded). Set to 0 to disable the
 # escape and always defer on a busy verdict, matching the old behavior.
 BUSY_GUARD_ESCAPE_SECS_DEFAULT=300
+# Upper clamp on FM_BUSY_GUARD_ESCAPE_SECS: large enough to never bind a
+# legitimate configuration (the default is five minutes), small enough that
+# resolve_busy_guard_escape_secs's forced-decimal parse stays comfortably
+# inside bash's integer arithmetic instead of risking an overflow on an
+# absurd operator-supplied value.
+BUSY_GUARD_ESCAPE_SECS_MAX=86400
+# Resolved once at daemon start by resolve_busy_guard_escape_secs (below);
+# empty until then, in which case inject_msg falls back to the default.
+BUSY_GUARD_ESCAPE_SECS_RESOLVED=
+# In-process elapsed clock for the busy-guard escape in inject_msg: empty
+# means no busy+empty-composer streak is currently being timed. Deliberately
+# a plain variable, not a durable file - see inject_msg's busy-guard comment.
+BUSY_GUARD_SINCE_EPOCH=
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
@@ -1134,6 +1149,35 @@ window_for_task() {  # <task-key> [state]
   return 1
 }
 
+# resolve_busy_guard_escape_secs: resolve FM_BUSY_GUARD_ESCAPE_SECS into
+# BUSY_GUARD_ESCAPE_SECS_RESOLVED exactly once, rather than re-parsing and
+# re-validating it on every busy-guard attempt. 0 (and only 0) disables the
+# escape; a positive integer up to BUSY_GUARD_ESCAPE_SECS_MAX sets the
+# interval; anything else - blank, non-numeric, negative, or above the clamp -
+# is refused with one loud log line and the default applied, never a silent
+# permanent disable. A digit-only value is parsed with the base forced to 10
+# (`10#`), so a leading-zero literal like 010 reads as decimal ten - never as
+# bash arithmetic's C-style octal (which would silently read 010 as eight and
+# outright error on 008/009). Called once by fm_super_main at daemon start;
+# tests call it directly to set up the resolved value before exercising
+# inject_msg.
+resolve_busy_guard_escape_secs() {
+  local raw=${FM_BUSY_GUARD_ESCAPE_SECS:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT} val
+  case "$raw" in
+    ''|*[!0-9]*)
+      log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='${raw}' is not zero or a positive integer; refusing it and using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
+      val=$BUSY_GUARD_ESCAPE_SECS_DEFAULT ;;
+    *)
+      val=$((10#$raw))
+      if [ "$val" -gt "$BUSY_GUARD_ESCAPE_SECS_MAX" ]; then
+        log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS=${val} exceeds the ${BUSY_GUARD_ESCAPE_SECS_MAX}s clamp; using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
+        val=$BUSY_GUARD_ESCAPE_SECS_DEFAULT
+      fi
+      ;;
+  esac
+  BUSY_GUARD_ESCAPE_SECS_RESOLVED=$val
+}
+
 # --- injection --------------------------------------------------------------
 # inject_msg: send one escalation digest to the supervisor pane.
 # Returns 0 on successful inject (or empty buffer), non-zero if the pane is
@@ -1156,7 +1200,7 @@ window_for_task() {  # <task-key> [state]
 #     would merge with the human's text.
 inject_msg() {  # <message> [state]
   local msg=$1 state target backend retries sleep_s verdict composer encoded \
-        since_file since since_valid afk_started now age escape_secs escape_secs_raw
+        now age escape_secs
   state="${2:-$(_state_root)}"
   # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
   # daemon self-handles and stays quiet; firstmate drives the normal always-on
@@ -1177,7 +1221,6 @@ inject_msg() {  # <message> [state]
   # discovery), matching this function's pre-existing default assumption.
   backend="${FM_SUPERVISOR_BACKEND:-tmux}"
   fm_backend_target_exists "$backend" "$target" || return 1
-  since_file="$state/.subsuper-busy-guard-since"
   # (3) Busy-guard: never inject into an in-use supervisor pane, with one
   # bounded escape. A busy verdict (native or regex-fallback) that persists
   # while the composer below reads provably empty is the exact false-positive
@@ -1188,56 +1231,30 @@ inject_msg() {  # <message> [state]
   # is the accurate signal - it reads the actual input area and has never once
   # been the deferring guard across six observed runs - so once the busy
   # guard has disagreed with a confirmed-empty composer for
-  # FM_BUSY_GUARD_ESCAPE_SECS straight, delivering is safer than deferring
-  # again. Only an exact 'empty' composer read counts: pending, unknown, and a
-  # bare dead-shell prompt still defer with no escape.
+  # BUSY_GUARD_ESCAPE_SECS_RESOLVED straight, delivering is safer than
+  # deferring again. Only an exact 'empty' composer read counts: pending,
+  # unknown, and a bare dead-shell prompt still defer with no escape.
+  #
+  # The elapsed clock (BUSY_GUARD_SINCE_EPOCH) is an in-PROCESS global, not a
+  # durable file: inject_msg is only ever called from housekeeping and the
+  # daemon's own shutdown trap, both inside fm_super_main's single long-lived
+  # process, so a plain variable is sufficient and a daemon restart starts a
+  # fresh clock for free - it cannot inherit a stale value left by a prior
+  # away session the way a durable marker file could.
   if pane_is_busy "$target" "$backend"; then
     composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
     if [ "$composer" != empty ]; then
-      rm -f "$since_file"
+      BUSY_GUARD_SINCE_EPOCH=
       log "inject deferred: supervisor pane busy (${PANE_BUSY_LAST_SOURCE:-agent mid-turn})"
       return 1
     fi
     now=$(_now)
-    since=$(cat "$since_file" 2>/dev/null || true)
-    # A leftover marker from a PRIOR away session must never satisfy the
-    # threshold on this session's very first busy+empty observation - that is
-    # exactly the "guard state outlives the run it measured" failure this
-    # ticket exists to prevent. afk_enter stamps state/.afk with the epoch
-    # this away session began, so a marker older than that stamp (or simply
-    # absent or non-numeric) is stale and gets reset to "now" instead of
-    # trusted.
-    afk_started=$(cat "$state/$AFK_FLAG_NAME" 2>/dev/null || true)
-    since_valid=1
-    case "$since" in ''|*[!0-9]*) since_valid=0 ;; esac
-    if [ "$since_valid" -eq 1 ]; then
-      case "$afk_started" in
-        ''|*[!0-9]*) : ;; # can't corroborate against this session's start; trust the marker as-is
-        *) [ "$since" -ge "$afk_started" ] || since_valid=0 ;;
-      esac
-    fi
-    if [ "$since_valid" -eq 0 ]; then
-      since=$now
-      printf '%s\n' "$since" > "$since_file" 2>/dev/null || true
-    fi
-    age=$((now - since))
-    # FM_BUSY_GUARD_ESCAPE_SECS: 0 (and only 0) disables the escape; a
-    # positive integer sets the interval; anything else (blank, non-numeric,
-    # negative) is refused loudly and the default is used instead - never a
-    # silent, permanent disable. A digit-only value is parsed with the base
-    # forced to 10 (`10#`), so a leading-zero literal like 010 reads as
-    # decimal ten - never as bash arithmetic's C-style octal (which would
-    # silently read 010 as eight and outright error on 008/009).
-    escape_secs_raw=${FM_BUSY_GUARD_ESCAPE_SECS:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT}
-    case "$escape_secs_raw" in
-      ''|*[!0-9]*)
-        log "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='${escape_secs_raw}' is not zero or a positive integer; refusing it and using the default (${BUSY_GUARD_ESCAPE_SECS_DEFAULT}s) instead"
-        escape_secs=$BUSY_GUARD_ESCAPE_SECS_DEFAULT ;;
-      *) escape_secs=$((10#$escape_secs_raw)) ;;
-    esac
+    [ -n "${BUSY_GUARD_SINCE_EPOCH:-}" ] || BUSY_GUARD_SINCE_EPOCH=$now
+    age=$((now - BUSY_GUARD_SINCE_EPOCH))
+    escape_secs=${BUSY_GUARD_ESCAPE_SECS_RESOLVED:-$BUSY_GUARD_ESCAPE_SECS_DEFAULT}
     if [ "$escape_secs" -gt 0 ] && [ "$age" -ge "$escape_secs" ]; then
       log "inject busy-guard override: ${PANE_BUSY_LAST_SOURCE:-native agent-state} read busy for ${age}s straight while the composer stayed provably empty; delivering instead of deferring further"
-      rm -f "$since_file"
+      BUSY_GUARD_SINCE_EPOCH=
       # Fall through: composer confirmed empty, so the guard below re-checks
       # it once more immediately before typing and the submit proceeds.
     else
@@ -1245,7 +1262,7 @@ inject_msg() {  # <message> [state]
       return 1
     fi
   else
-    rm -f "$since_file"
+    BUSY_GUARD_SINCE_EPOCH=
   fi
   #   b) Composer-guard: inject ONLY into a confirmed-empty GENUINE agent
   #      composer. The shared classifier (fm_backend_composer_state ->
@@ -1556,7 +1573,8 @@ fm_super_main() {
 
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
-  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
+  resolve_busy_guard_escape_secs
+  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s; busy_guard_escape=${BUSY_GUARD_ESCAPE_SECS_RESOLVED}s"
   migrate_watcher_pause_markers "$STATE"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------

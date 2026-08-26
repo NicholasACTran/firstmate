@@ -1830,8 +1830,8 @@ test_inject_msg_herdr_busy_guard_defers() {
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
       fail "inject_msg should defer (return non-zero) when the herdr supervisor pane is busy"
     fi
-    assert_absent "$state/.subsuper-busy-guard-since" \
-      "no escape-hatch clock should start while the composer is not confirmed empty"
+    [ -z "${BUSY_GUARD_SINCE_EPOCH:-}" ] \
+      || fail "no in-process escape clock should start while the composer is not confirmed empty"
   ) || fail "herdr busy-guard inject_msg subshell failed"
   pass "inject_msg: herdr busy-guard defers before ever attempting a submit"
 }
@@ -1848,41 +1848,56 @@ test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold() {
   state="$dir/state"
   afk_enter "$state"
   (
+    BUSY_GUARD_SINCE_EPOCH=
     fm_backend_target_exists() { return 0; }
     pane_is_busy() { PANE_BUSY_LAST_SOURCE="native agent-state (agent_status=busy)"; return 0; }
     fm_backend_composer_state() { printf 'empty'; }
     fm_backend_send_text_submit() { fail "send_text_submit must not run before the escape threshold elapses"; }
-    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=300 \
-        inject_msg "hello" "$state"; then
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
       fail "inject_msg should still defer on the first busy+empty-composer observation"
     fi
-    assert_present "$state/.subsuper-busy-guard-since" \
-      "the first busy+empty-composer observation should start the escape-hatch clock"
+    [ -n "$BUSY_GUARD_SINCE_EPOCH" ] \
+      || fail "the first busy+empty-composer observation should start the in-process escape clock"
   ) || fail "busy+empty-composer pre-escape subshell failed"
   pass "inject_msg: busy verdict with a confirmed-empty composer still defers until the escape threshold elapses"
 }
 
+# Review fix (redesign, PR #3090 round 4): the escape clock now lives in the
+# daemon PROCESS (a plain variable), not on disk, so it cannot outlive a
+# restart or be inherited from a prior away session. This drives fake elapsed
+# time through the shared `_now` stub (never a real sleep) across two calls in
+# ONE subshell - the same in-process continuity a real daemon has across
+# housekeeping ticks.
 test_inject_msg_busy_guard_escapes_after_threshold() {
   local dir state
   dir=$(make_supercase inject-busy-guard-escape)
   state="$dir/state"
-  mkdir -p "$state"
-  # This away session started well before the busy+empty-composer streak did,
-  # so the streak marker is legitimately old relative to THIS run, not a
-  # leftover from a previous one.
-  printf '%s\n' "$(( $(date +%s) - 1000 ))" > "$state/.afk"
-  printf '%s\n' "$(( $(date +%s) - 400 ))" > "$state/.subsuper-busy-guard-since"
+  afk_enter "$state"
   (
     LOG="$state/daemon.log"
+    BUSY_GUARD_SINCE_EPOCH=
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
     pane_is_busy() { PANE_BUSY_LAST_SOURCE="native agent-state (agent_status=busy)"; return 0; }
     fm_backend_composer_state() { printf 'empty'; }
+
+    _now() { printf '1000'; }
+    fm_backend_send_text_submit() { fail "must not escape on the first busy+empty observation"; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg should defer on the first observation (age 0)"
+    fi
+
+    _now() { printf '1299'; }  # 299s elapsed: still one second short
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg should still defer one second before the escape threshold"
+    fi
+
+    _now() { printf '1300'; }  # 300s elapsed: exactly at the threshold
     fm_backend_send_text_submit() { printf 'empty'; }
-    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=300 \
-      inject_msg "hello" "$state" \
-      || fail "inject_msg should deliver once the busy guard has disagreed with an empty composer past the escape threshold"
-    assert_absent "$state/.subsuper-busy-guard-since" \
-      "the escape-hatch clock should reset once it has fired"
+    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state" \
+      || fail "inject_msg should deliver once the busy guard has disagreed with an empty composer for the full escape threshold"
+    [ -z "$BUSY_GUARD_SINCE_EPOCH" ] || fail "the escape clock should reset once it has fired"
     assert_grep "inject busy-guard override" "$LOG" \
       "a fired escape should log that it overrode the busy guard: $(cat "$LOG" 2>/dev/null)"
   ) || fail "busy-guard escape-after-threshold subshell failed"
@@ -1893,148 +1908,132 @@ test_inject_msg_busy_guard_escape_disabled_by_zero() {
   local dir state
   dir=$(make_supercase inject-busy-guard-escape-disabled)
   state="$dir/state"
-  mkdir -p "$state"
-  printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$state/.afk"
-  printf '%s\n' "$(( $(date +%s) - 99999 ))" > "$state/.subsuper-busy-guard-since"
+  afk_enter "$state"
   (
+    BUSY_GUARD_SINCE_EPOCH=
+    FM_BUSY_GUARD_ESCAPE_SECS=0 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
     pane_is_busy() { return 0; }
     fm_backend_composer_state() { printf 'empty'; }
     fm_backend_send_text_submit() { fail "send_text_submit must not run when FM_BUSY_GUARD_ESCAPE_SECS=0 disables the escape"; }
-    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=0 \
-        inject_msg "hello" "$state"; then
+    _now() { printf '1000'; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "inject_msg should defer on the first observation"
+    fi
+    _now() { printf '9999999'; }  # an enormous elapsed time; still must never escape
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
       fail "inject_msg should never escape the busy guard when FM_BUSY_GUARD_ESCAPE_SECS=0"
     fi
   ) || fail "busy-guard escape-disabled subshell failed"
   pass "inject_msg: FM_BUSY_GUARD_ESCAPE_SECS=0 keeps the busy guard deferring forever, matching the pre-fix behavior"
 }
 
-# Review fix (P1, PR #3090): a busy-guard-since marker left over from a PRIOR
-# away session must NOT satisfy the escape threshold on THIS session's very
-# first busy+empty observation. Without the fix this test fails: a leftover
-# marker from long before the current away session started would read as
-# already-overdue and inject_msg would deliver immediately into what could be
-# an active supervisor turn, instead of waiting out the interval.
-test_inject_msg_busy_guard_stale_marker_from_prior_session_does_not_escape() {
-  local dir state since_after afk_started
-  dir=$(make_supercase inject-busy-guard-stale-marker)
+# Review fix (redesign, PR #3090 round 4): a daemon restart is a new PROCESS,
+# so the escape clock - a plain variable - starts fresh automatically; there
+# is no durable marker left to inherit or corroborate. This test simulates
+# "restart" the only way that is meaningful for an in-process variable: a
+# fresh subshell (this test's own) never sees the BUSY_GUARD_SINCE_EPOCH a
+# DIFFERENT subshell advanced, because bash subshells never write state back
+# to their parent - so the very next busy+empty observation in a new subshell
+# must start counting from zero, not resume some inherited streak.
+test_inject_msg_busy_guard_restart_gets_a_fresh_clock() {
+  local dir state
+  dir=$(make_supercase inject-busy-guard-restart)
   state="$dir/state"
-  afk_enter "$state"  # this session's .afk starts "now"
-  mkdir -p "$state"
-  # A marker left behind by a much earlier away session - far older than
-  # FM_BUSY_GUARD_ESCAPE_SECS, and older than THIS session's .afk stamp.
-  printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$state/.subsuper-busy-guard-since"
+  afk_enter "$state"
+
+  # "Prior away session": advance the clock to just one second under its
+  # escape threshold, entirely inside its own subshell.
   (
+    BUSY_GUARD_SINCE_EPOCH=
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
     fm_backend_target_exists() { return 0; }
     pane_is_busy() { return 0; }
     fm_backend_composer_state() { printf 'empty'; }
-    fm_backend_send_text_submit() { fail "a stale cross-session marker must not be honored as already-overdue"; }
-    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=300 \
-        inject_msg "hello" "$state"; then
-      fail "inject_msg must not escape on a stale marker inherited from a prior away session"
+    fm_backend_send_text_submit() { fail "must not escape yet"; }
+    _now() { printf '1000'; }
+    inject_msg "hello" "$state" >/dev/null 2>&1
+    _now() { printf '1299'; }
+    inject_msg "hello" "$state" >/dev/null 2>&1
+    true  # both calls above are expected defers (non-zero); do not let that leak as this subshell's own exit status
+  ) || fail "prior-session simulation subshell failed"
+
+  # "New away session, new daemon process": a fresh subshell, at the SAME
+  # wall-clock instant the prior one left off. If the clock survived (the bug
+  # this test guards against), this would escape immediately.
+  (
+    BUSY_GUARD_SINCE_EPOCH=
+    FM_BUSY_GUARD_ESCAPE_SECS=300 resolve_busy_guard_escape_secs
+    fm_backend_target_exists() { return 0; }
+    pane_is_busy() { return 0; }
+    fm_backend_composer_state() { printf 'empty'; }
+    fm_backend_send_text_submit() { fail "a fresh process must not inherit a prior process's escape clock"; }
+    _now() { printf '1299'; }
+    if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" inject_msg "hello" "$state"; then
+      fail "a fresh process's first observation must defer, not escape immediately"
     fi
-  ) || fail "stale cross-session marker subshell failed"
-  since_after=$(cat "$state/.subsuper-busy-guard-since" 2>/dev/null || echo '')
-  case "$since_after" in
-    ''|*[!0-9]*) fail "the stale marker should have been rewritten to a fresh numeric epoch, got: $since_after" ;;
-  esac
-  afk_started=$(cat "$state/.afk")
-  [ "$since_after" -ge "$afk_started" ] \
-    || fail "the rewritten marker ($since_after) should not predate this session's .afk stamp ($afk_started)"
-  pass "inject_msg: a busy-guard-since marker inherited from a prior away session is treated as stale, not as already-overdue"
+  ) || fail "fresh-process subshell failed"
+  pass "inject_msg: a daemon restart (a new process) gets a fresh escape clock, never inheriting a prior run's elapsed time"
 }
 
-# Review fix (P2, PR #3090): FM_BUSY_GUARD_ESCAPE_SECS's contract is "zero and
-# only zero disables the escape". A non-numeric or negative value must be
-# refused loudly with the default applied, never silently disable the escape
-# forever (and never throw a bare integer-expression error either).
-test_inject_msg_busy_guard_escape_secs_invalid_value_falls_back_and_logs() {
-  local dir state
-  dir=$(make_supercase inject-busy-guard-escape-secs-invalid)
-  state="$dir/state"
-  mkdir -p "$state"
-  printf '%s\n' "$(( $(date +%s) - 1000 ))" > "$state/.afk"
-  # Already past the DEFAULT (300s) threshold, so a correct fallback escapes.
-  printf '%s\n' "$(( $(date +%s) - 400 ))" > "$state/.subsuper-busy-guard-since"
-  (
-    LOG="$state/daemon.log"
-    fm_backend_target_exists() { return 0; }
-    pane_is_busy() { return 0; }
-    fm_backend_composer_state() { printf 'empty'; }
-    fm_backend_send_text_submit() { printf 'empty'; }
-    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=not-a-number \
-      inject_msg "hello" "$state" \
-      || fail "inject_msg should fall back to the default escape interval on a non-numeric override, not disable the escape"
-    assert_grep "inject busy-guard escape: FM_BUSY_GUARD_ESCAPE_SECS='not-a-number' is not zero or a positive integer" "$LOG" \
-      "an invalid override should be refused loudly: $(cat "$LOG" 2>/dev/null)"
-  ) || fail "invalid FM_BUSY_GUARD_ESCAPE_SECS subshell failed"
-  pass "inject_msg: a non-numeric FM_BUSY_GUARD_ESCAPE_SECS is refused loudly and falls back to the default instead of silently disabling the escape"
-}
-
-test_inject_msg_busy_guard_escape_secs_negative_value_falls_back() {
-  local dir state
-  dir=$(make_supercase inject-busy-guard-escape-secs-negative)
-  state="$dir/state"
-  mkdir -p "$state"
-  printf '%s\n' "$(( $(date +%s) - 1000 ))" > "$state/.afk"
-  printf '%s\n' "$(( $(date +%s) - 400 ))" > "$state/.subsuper-busy-guard-since"
-  (
-    fm_backend_target_exists() { return 0; }
-    pane_is_busy() { return 0; }
-    fm_backend_composer_state() { printf 'empty'; }
-    fm_backend_send_text_submit() { printf 'empty'; }
-    FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS=-5 \
-      inject_msg "hello" "$state" \
-      || fail "a negative FM_BUSY_GUARD_ESCAPE_SECS should fall back to the default and still escape, not disable forever"
-  ) || fail "negative FM_BUSY_GUARD_ESCAPE_SECS subshell failed"
-  pass "inject_msg: a negative FM_BUSY_GUARD_ESCAPE_SECS is refused and falls back to the default"
-}
-
-# Review fix (P1 round 2, PR #3090): a digit-only FM_BUSY_GUARD_ESCAPE_SECS
-# with a leading zero (010, 008, 009, 007) must take effect at the DECIMAL
-# value the operator wrote, never bash arithmetic's C-style octal reading (010
-# as eight, or an outright error on 008/009). For each value this asserts the
-# EFFECTIVE interval directly - one age just under it must still defer, the
-# same age AT it must escape - rather than only checking that validation
-# accepted the string, which would pass even with the leading zero misparsed.
-test_inject_msg_busy_guard_escape_secs_leading_zero_parsed_as_decimal() {
-  local pair raw expected dir state
-  for pair in 007:7 008:8 009:9 010:10 5:5; do
+# Review fix (redesign, PR #3090 round 4): FM_BUSY_GUARD_ESCAPE_SECS is now
+# resolved exactly once, by resolve_busy_guard_escape_secs, into
+# BUSY_GUARD_ESCAPE_SECS_RESOLVED. These assert that resolved value directly -
+# the EFFECTIVE interval - rather than only that resolution didn't error,
+# covering zero, a plain positive, every leading-zero form that could be
+# misread as octal, the clamp boundary, and invalid input.
+test_resolve_busy_guard_escape_secs_valid_and_leading_zero_values() {
+  local pair raw expected
+  for pair in 0:0 5:5 007:7 008:8 009:9 010:10 300:300; do
     raw=${pair%%:*}
     expected=${pair#*:}
-
-    dir=$(make_supercase "inject-escape-secs-decimal-$raw-under")
-    state="$dir/state"
-    mkdir -p "$state"
-    printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$state/.afk"
-    printf '%s\n' "$(( $(date +%s) - (expected - 1) ))" > "$state/.subsuper-busy-guard-since"
     (
-      fm_backend_target_exists() { return 0; }
-      pane_is_busy() { return 0; }
-      fm_backend_composer_state() { printf 'empty'; }
-      fm_backend_send_text_submit() { fail "raw='$raw' (effective ${expected}s): escaped one second early - a leading zero was misparsed as octal"; }
-      if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS="$raw" \
-          inject_msg "hello" "$state"; then
-        fail "raw='$raw': inject_msg should still defer just under its effective interval (${expected}s)"
-      fi
-    ) || fail "raw='$raw' pre-threshold subshell failed"
-
-    dir=$(make_supercase "inject-escape-secs-decimal-$raw-at")
-    state="$dir/state"
-    mkdir -p "$state"
-    printf '%s\n' "$(( $(date +%s) - 100000 ))" > "$state/.afk"
-    printf '%s\n' "$(( $(date +%s) - expected ))" > "$state/.subsuper-busy-guard-since"
-    (
-      fm_backend_target_exists() { return 0; }
-      pane_is_busy() { return 0; }
-      fm_backend_composer_state() { printf 'empty'; }
-      fm_backend_send_text_submit() { printf 'empty'; }
-      FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:p2" FM_BUSY_GUARD_ESCAPE_SECS="$raw" \
-        inject_msg "hello" "$state" \
-        || fail "raw='$raw': inject_msg should escape once age reaches its effective interval (${expected}s) - got a defer, so the value was not read as decimal $expected"
-    ) || fail "raw='$raw' at-threshold subshell failed"
+      FM_BUSY_GUARD_ESCAPE_SECS="$raw"
+      resolve_busy_guard_escape_secs
+      [ "$BUSY_GUARD_ESCAPE_SECS_RESOLVED" = "$expected" ] \
+        || fail "FM_BUSY_GUARD_ESCAPE_SECS='$raw' resolved to '$BUSY_GUARD_ESCAPE_SECS_RESOLVED', expected '$expected' (decimal, not octal)"
+    ) || fail "resolve subshell failed for raw='$raw'"
   done
-  pass "inject_msg: FM_BUSY_GUARD_ESCAPE_SECS with a leading zero (007/008/009/010) takes effect at its decimal value, never bash's C-style octal reading"
+  pass "resolve_busy_guard_escape_secs: 0, a plain positive, and every leading-zero form (007/008/009/010) resolve to their decimal value"
+}
+
+test_resolve_busy_guard_escape_secs_clamp_boundary() {
+  (
+    FM_BUSY_GUARD_ESCAPE_SECS="$BUSY_GUARD_ESCAPE_SECS_MAX"
+    resolve_busy_guard_escape_secs
+    [ "$BUSY_GUARD_ESCAPE_SECS_RESOLVED" = "$BUSY_GUARD_ESCAPE_SECS_MAX" ] \
+      || fail "a value exactly AT the clamp ($BUSY_GUARD_ESCAPE_SECS_MAX) should be accepted as-is, got $BUSY_GUARD_ESCAPE_SECS_RESOLVED"
+  ) || fail "at-clamp subshell failed"
+  (
+    LOG="$TMP_ROOT/clamp-over.log"
+    FM_BUSY_GUARD_ESCAPE_SECS=$((BUSY_GUARD_ESCAPE_SECS_MAX + 1))
+    resolve_busy_guard_escape_secs
+    [ "$BUSY_GUARD_ESCAPE_SECS_RESOLVED" = "$BUSY_GUARD_ESCAPE_SECS_DEFAULT" ] \
+      || fail "a value one past the clamp should fall back to the default, got $BUSY_GUARD_ESCAPE_SECS_RESOLVED"
+    assert_grep "exceeds the ${BUSY_GUARD_ESCAPE_SECS_MAX}s clamp" "$LOG" \
+      "exceeding the clamp should be refused loudly: $(cat "$LOG" 2>/dev/null)"
+  ) || fail "over-clamp subshell failed"
+  pass "resolve_busy_guard_escape_secs: a value at the clamp is accepted, one past it falls back to the default with a loud log line"
+}
+
+test_resolve_busy_guard_escape_secs_invalid_falls_back_and_logs() {
+  local raw
+  # An empty FM_BUSY_GUARD_ESCAPE_SECS is not covered here: bash's ${VAR:-default}
+  # treats an explicitly-empty var the same as unset, so it silently resolves to
+  # the default before validation ever sees it - that is correct, unremarkable
+  # shell convention, not an invalid-input case.
+  for raw in not-a-number -5; do
+    (
+      LOG="$TMP_ROOT/invalid-$$.log"
+      FM_BUSY_GUARD_ESCAPE_SECS="$raw"
+      resolve_busy_guard_escape_secs
+      [ "$BUSY_GUARD_ESCAPE_SECS_RESOLVED" = "$BUSY_GUARD_ESCAPE_SECS_DEFAULT" ] \
+        || fail "FM_BUSY_GUARD_ESCAPE_SECS='$raw' should fall back to the default ($BUSY_GUARD_ESCAPE_SECS_DEFAULT), got $BUSY_GUARD_ESCAPE_SECS_RESOLVED"
+      assert_grep "is not zero or a positive integer" "$LOG" \
+        "an invalid override ('$raw') should be refused loudly: $(cat "$LOG" 2>/dev/null)"
+    ) || fail "invalid-value subshell failed for raw='$raw'"
+  done
+  pass "resolve_busy_guard_escape_secs: blank, non-numeric, and negative overrides are refused loudly and fall back to the default, never a silent permanent disable"
 }
 
 # Diagnostic fix (same investigation): a successful delivery used to log
@@ -2266,8 +2265,8 @@ test_inject_msg_defers_on_unrecognized_composer_state
 test_inject_msg_busy_with_empty_composer_defers_before_escape_threshold
 test_inject_msg_busy_guard_escapes_after_threshold
 test_inject_msg_busy_guard_escape_disabled_by_zero
-test_inject_msg_busy_guard_stale_marker_from_prior_session_does_not_escape
-test_inject_msg_busy_guard_escape_secs_invalid_value_falls_back_and_logs
-test_inject_msg_busy_guard_escape_secs_negative_value_falls_back
-test_inject_msg_busy_guard_escape_secs_leading_zero_parsed_as_decimal
+test_inject_msg_busy_guard_restart_gets_a_fresh_clock
+test_resolve_busy_guard_escape_secs_valid_and_leading_zero_values
+test_resolve_busy_guard_escape_secs_clamp_boundary
+test_resolve_busy_guard_escape_secs_invalid_falls_back_and_logs
 test_inject_msg_records_last_delivery_on_success
