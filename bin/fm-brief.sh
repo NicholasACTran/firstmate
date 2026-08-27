@@ -52,6 +52,11 @@
 # Every scaffold also carries the steering-inbox receive-and-ack section:
 # process state/<id>.inbox/*.msg in order and acknowledge each by moving it to
 # handled/ (record, doorbell, and ladder owned by bin/fm-task-inbox-lib.sh).
+# The ship and scout Rules sections both carry the structural-zero stop rule, so a
+# task that measures anything stops once a whole class reaches nothing at a named
+# stage that other classes clear in the same run. The secondmate charter has no
+# Rules section and runs no draws itself; its crewmates inherit the rule through
+# their own ship or scout brief.
 # Ship tasks include a project-memory section so durable project-intrinsic
 # learnings can be committed to AGENTS.md through the project's delivery path;
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
