@@ -53,8 +53,10 @@
 # process state/<id>.inbox/*.msg in order and acknowledge each by moving it to
 # handled/ (record, doorbell, and ladder owned by bin/fm-task-inbox-lib.sh).
 # The ship and scout Rules sections both carry the structural-zero stop rule, so a
-# task that measures anything stops once a whole class reaches nothing at a named
-# stage that other classes clear in the same run. The secondmate charter has no
+# task that measures anything stops once a whole class that was loaded at least as
+# heavily as its peers reaches nothing at a named stage those peers clear in the
+# same run - the loaded-volume precondition is what separates a blocked stage from
+# a thin draw that happened to come up empty. The secondmate charter has no
 # Rules section and runs no draws itself; its crewmates inherit the rule through
 # their own ship or scout brief.
 # Ship tasks include a project-memory section so durable project-intrinsic
@@ -362,12 +364,14 @@ The report is the only thing that survives, so anything worth keeping must be in
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
 8. A zero at a named stage is a stop condition, not a data point to replicate. If a whole class
-   reaches no finding at that stage while other classes clear the same stage in the same run, the
-   cause is structural and no further draw can change it: confirm with at most one more draw, then
-   stop and report rather than running remaining arms to completion for symmetry. The caution that
-   one draw cannot distinguish a mechanism from a draw does not apply here - that is about a NUMBER
-   that varies between draws, not about nothing reaching a stage at all. Report the stop as a
-   complete outcome: the finding is the answer, and the unrun draws are a saving, not a gap.
+   reaches no finding at that stage while other classes clear the same stage in the same run, and
+   that class entered the stage carrying at least as much loaded volume as the classes that
+   cleared it, the cause is structural and no further draw can change it: confirm with at most one
+   more draw, then stop and report rather than running remaining arms to completion for symmetry.
+   The caution that one draw cannot distinguish a mechanism from a draw does not apply here - that
+   is about a NUMBER that varies between draws, not about nothing reaching a stage at all. Report
+   the stop as a complete outcome: the finding is the answer, and the unrun draws are a saving,
+   not a gap.
 
 $INBOX_SECTION
 
@@ -488,12 +492,14 @@ $RULE1
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
 8. A zero at a named stage is a stop condition, not a data point to replicate. If a whole class
-   reaches no finding at that stage while other classes clear the same stage in the same run, the
-   cause is structural and no further draw can change it: confirm with at most one more draw, then
-   stop and report rather than running remaining arms to completion for symmetry. The caution that
-   one draw cannot distinguish a mechanism from a draw does not apply here - that is about a NUMBER
-   that varies between draws, not about nothing reaching a stage at all. Report the stop as a
-   complete outcome: the finding is the answer, and the unrun draws are a saving, not a gap.
+   reaches no finding at that stage while other classes clear the same stage in the same run, and
+   that class entered the stage carrying at least as much loaded volume as the classes that
+   cleared it, the cause is structural and no further draw can change it: confirm with at most one
+   more draw, then stop and report rather than running remaining arms to completion for symmetry.
+   The caution that one draw cannot distinguish a mechanism from a draw does not apply here - that
+   is about a NUMBER that varies between draws, not about nothing reaching a stage at all. Report
+   the stop as a complete outcome: the finding is the answer, and the unrun draws are a saving,
+   not a gap.
 
 $INBOX_SECTION
 

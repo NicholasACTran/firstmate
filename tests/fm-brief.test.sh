@@ -761,9 +761,11 @@ test_structural_zero_stop_rule_present() {
   brief="$home/data/brief-szero-ship/brief.md"
   assert_grep "A zero at a named stage is a stop condition, not a data point to replicate" "$brief" \
     "ship brief Rules section missing the structural-zero stop rule"
+  assert_grep "at least as much loaded volume as the classes that" "$brief" \
+    "ship brief structural-zero rule missing the loaded-volume precondition"
   assert_grep "does not apply here" "$brief" \
     "ship brief structural-zero rule missing the n=1-caution carve-out"
-  assert_grep "the unrun draws are a saving, not a gap" "$brief" \
+  assert_grep "the unrun draws are a saving," "$brief" \
     "ship brief structural-zero rule missing the complete-outcome framing"
 
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-szero-scout some-proj --scout >/dev/null 2>&1 \
@@ -771,6 +773,12 @@ test_structural_zero_stop_rule_present() {
   brief="$home/data/brief-szero-scout/brief.md"
   assert_grep "A zero at a named stage is a stop condition, not a data point to replicate" "$brief" \
     "scout brief Rules section missing the structural-zero stop rule"
+  assert_grep "at least as much loaded volume as the classes that" "$brief" \
+    "scout brief structural-zero rule missing the loaded-volume precondition"
+  assert_grep "does not apply here" "$brief" \
+    "scout brief structural-zero rule missing the n=1-caution carve-out"
+  assert_grep "the unrun draws are a saving," "$brief" \
+    "scout brief structural-zero rule missing the complete-outcome framing"
   pass "fm-brief.sh: structural-zero stop rule lands in generated ship and scout briefs"
 }
 
