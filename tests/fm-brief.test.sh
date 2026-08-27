@@ -763,6 +763,8 @@ test_structural_zero_stop_rule_present() {
     "ship brief Rules section missing the structural-zero stop rule"
   assert_grep "cause is structural and no further draw can change it" "$brief" \
     "ship brief structural-zero rule missing the structural-cause conclusion"
+  assert_grep "at least as much loaded volume as the classes that" "$brief" \
+    "ship brief structural-zero rule missing the loaded-volume precondition"
   assert_grep "does not apply here" "$brief" \
     "ship brief structural-zero rule missing the n=1-caution carve-out"
   assert_grep "the unrun draws are a saving," "$brief" \
@@ -775,6 +777,8 @@ test_structural_zero_stop_rule_present() {
     "scout brief Rules section missing the structural-zero stop rule"
   assert_grep "cause is structural and no further draw can change it" "$brief" \
     "scout brief structural-zero rule missing the structural-cause conclusion"
+  assert_grep "at least as much loaded volume as the classes that" "$brief" \
+    "scout brief structural-zero rule missing the loaded-volume precondition"
   assert_grep "does not apply here" "$brief" \
     "scout brief structural-zero rule missing the n=1-caution carve-out"
   assert_grep "the unrun draws are a saving," "$brief" \
