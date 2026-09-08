@@ -449,7 +449,7 @@ test_every_worker_brief_forbids_an_agent_co_author() {
     n=$(count_coauthor_rules "$brief")
     [ "$n" = 1 ] || fail "ship brief ($mode) must carry exactly one co-author hard rule (found $n)"
   done
-  id=brief-coauthor-scout
+  id="brief-coauthor-scout"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "scout brief was not scaffolded"
