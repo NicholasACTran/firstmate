@@ -427,12 +427,14 @@ test_ask_user_escalation_format() {
 # Every crewmate brief must carry the no-agent-co-author rule as its own top-level
 # hard rule, not as a clause buried in another rule or in captain-only instructions
 # a crewmate worktree never reads. Parsed from the generated brief's Rules section
-# as numbered rules so the assertion is about the delivered contract's structure.
+# as numbered rules so the assertion is about the delivered contract's structure,
+# and matched on the prohibition itself so permissive wording or a rule that
+# drops the agent-name qualification stops counting instead of passing silently.
 count_coauthor_rules() {  # <brief>
   awk '
     $0 == "# Rules" { in_rules = 1; next }
     in_rules && /^# / { in_rules = 0 }
-    in_rules && /^[0-9]+\. / && /commit co-author/ { n++ }
+    in_rules && /^[0-9]+\. Never add an agent name as a commit co-author/ { n++ }
     END { print n + 0 }
   ' "$1"
 }
