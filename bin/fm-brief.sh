@@ -59,6 +59,9 @@
 # Every scaffold also carries the steering-inbox receive-and-ack section:
 # process state/<id>.inbox/*.msg in order and acknowledge each by moving it to
 # handled/ (record, doorbell, and ladder owned by bin/fm-task-inbox-lib.sh).
+# Ship and scout Rules each carry the no-agent-co-author rule as its own hard
+# rule, because a crewmate worktree never reads AGENTS.md's copy of it; the
+# attribution-off launch settings in bin/fm-spawn.sh are the mechanical half.
 # Ship tasks include a project-memory section so durable project-intrinsic
 # learnings can be committed to AGENTS.md through the project's delivery path;
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
