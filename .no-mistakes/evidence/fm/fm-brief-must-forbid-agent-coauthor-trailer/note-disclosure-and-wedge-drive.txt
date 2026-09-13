@@ -1,0 +1,22 @@
+--- worker status file as the brief instructs ---
+note: commits a1b2c3, d4e5f6 carry an agent co-author trailer
+done: PR https://github.com/o/r/pull/12 checks green
+reconciler PR extracted from terminal line : 'https://github.com/o/r/pull/12'
+note: line surfaces as UNREAD STATUS       : yes
+note: reads terminal                       : no
+done: still reads terminal                 : yes
+
+--- adversarial: disclosure folded into the done: line (the shape the brief forbids) ---
+done: PR https://github.com/o/r/pull/12 checks green - commits a1b2c3 carry Co-Authored-By: Claude
+reconciler PR extracted                    : '' (URL lost - why the disclosure must not go here)
+
+--- adversarial: note: prose containing captain free-text tokens ---
+note: rebased onto merged #76
+  captain-relevant (would clear wedge)     : no
+  terminal                                 : no
+note: waiting on PR ready upstream
+  captain-relevant (would clear wedge)     : no
+  terminal                                 : no
+note: checks green upstream, still working
+  captain-relevant (would clear wedge)     : no
+  terminal                                 : no

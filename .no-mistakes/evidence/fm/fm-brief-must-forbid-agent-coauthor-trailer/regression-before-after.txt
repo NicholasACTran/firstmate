@@ -1,0 +1,17 @@
+Regression reproduction: new brief test file run against the pre-change (base b518a25) scaffold
+
+ok - fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly
+not ok - brief-coauthor-nm: brief did not mention the co-author trailer ban at all (missing: 'co-author')
+--- output ---
+
+
+Same test file against the change (0ccf7d0):
+/private/var/folders/6w/ghhdhb9n40q6969qp9wymyzc0000gn/T/fm-brief.d18Dte/heredoc-in-substitution.sh:2
+ok - fm-brief.sh: no heredoc is nested inside a command substitution (Bash 3.2 parse-safe)
+ok - fm-brief.sh: --help renders the complete header
+ok - fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly
+
+(after-run tail)
+ok - fm-brief.sh: every ship mode forbids an agent co-author commit trailer
+ok - fm-brief.sh: a scout brief forbids an agent co-author commit trailer too
+ok - fm-brief.sh: a secondmate charter forbids an agent co-author commit trailer too
