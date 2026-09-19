@@ -1,0 +1,24 @@
+Pre-existing, deterministic failure in tests/fm-teardown.test.sh (NOT touched by
+this change; bin/ and this suite are byte-identical between base 1bb72cc and
+target 5e891bb - the diff is tests/fm-teardown-endpoint-safety.test.sh only).
+
+Reproduced 3/3 runs:
+  $ bin/fm-test-run.sh tests/fm-teardown.test.sh
+  not ok - herdr-preflight-missing-adapter: teardown continued without its required preflight
+  FM_TEST_SUMMARY total=1 failed=1 skipped_gate=0
+
+Probe of that one case (bin/backends/herdr.sh removed from a copied test-root,
+teardown run with --force):
+
+  PROBE mode=missing-adapter rc=0 UNEXPECTED SUCCESS
+  PROBE stderr:
+  .../test-root/bin/fm-backend.sh: line 633: .../test-root/bin/backends/herdr.sh: No such file or directory
+  PROBE stdout:                 (empty)
+  PROBE treehouse.log:          (empty)
+  PROBE adapter present: no
+
+fm-teardown.sh exits 0 with no output when the herdr adapter cannot be sourced.
+Nothing destructive ran (no treehouse return, no pane close), so this is a
+silent-success/exit-code question, not a data-loss one - but the test asserts a
+non-zero refusal and the expected "nothing was changed" message, and neither
+appears. The other preflight modes (unresolvable-lock) refuse correctly.

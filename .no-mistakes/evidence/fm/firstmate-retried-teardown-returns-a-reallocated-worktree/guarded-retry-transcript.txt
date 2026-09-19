@@ -1,0 +1,12 @@
+PROBE retry_exit=1
+PROBE treehouse_returns_before=1 treehouse_returns_after=1
+PROBE runtime.log:
+treehouse <return> <--force> </private/var/folders/6w/ghhdhb9n40q6969qp9wymyzc0000gn/T/fm-teardown-endpoint-safety.3Tph15/retry-slot-collision/worktree>
+PROBE live_task_meta_present=yes
+PROBE slot_claim=task=live-task home=/private/var/folders/6w/ghhdhb9n40q6969qp9wymyzc0000gn/T/fm-teardown-endpoint-safety.3Tph15/retry-slot-collision/other-home 
+PROBE retry_stderr:
+WARNING: watcher still down (same stale episode; last beat: never, grace 300s) - full banner already printed this episode.
+REFUSED: task stale-task's recorded worktree /private/var/folders/6w/ghhdhb9n40q6969qp9wymyzc0000gn/T/fm-teardown-endpoint-safety.3Tph15/retry-slot-collision/pool/1/project is also task live-task's recorded worktree.
+Returning that pool slot would kill live-task's processes and reset its copy, so nothing was changed - not even with --force.
+Reconcile whichever record is wrong (bin/fm-crew-state.sh stale-task; bin/fm-crew-state.sh live-task), then re-run teardown.
+ok - fm-teardown: a retried teardown after a partial failure never returns a pool slot another task has since claimed
