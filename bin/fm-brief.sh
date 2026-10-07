@@ -154,11 +154,11 @@ PAUSED_VERB=${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}
 IFS= read -r -d '' CREWMATE_PAUSE_INSTRUCTIONS <<EOF || true
    Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - when deliberately waiting for work or an external condition expected to clear on its own, including your own validation round.
    Before ending your turn with your own background shell or monitor still running, or before waiting on your own pipeline run or a long foreground command, append \`$PAUSED_VERB [at=<epoch>]: {job and completion condition}\` to the status file.
-   Name what you are waiting for and what will let you resume; do not repeat the declaration on every poll.
+   Name what you are waiting for and the resume condition, and test that condition for ANY terminal state - what the result concluded, success or failure - never one expected value like \`succeeded\` or an all-green read: a different terminal outcome loops forever against a condition that already resolved, and an unrecognised terminal state is still terminal.
+   Where a command blocks until terminality for you - \`gh pr checks <pr> --watch\` for PR checks, \`no-mistakes axi status\`'s own \`outcome\` and \`awaiting_agent\` fields for the pipeline - resume on it rather than a hand-written value match, and do not repeat the declaration on every poll.
    Do not declare active implementation or reasoning as a wait.
    Firstmate may still raise one first-sight alert; the declared wait then uses the existing long recheck cadence instead of repeated possible-wedge alarms.
-   When you know when the wait clears, include \`until <YYYY-MM-DDTHH:MMZ>\` (UTC) for a recheck at that time.
-   Follow the resolution rule below when the wait clears, then resume the task.
+   When you know when the wait clears, include \`until <YYYY-MM-DDTHH:MMZ>\` (UTC) for a recheck at that time, and follow the resolution rule below when it clears, then resume the task.
    Use \`blocked:\` when you are stuck and need help.
 EOF
 
