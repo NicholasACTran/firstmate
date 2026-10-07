@@ -1,0 +1,64 @@
+== brief-direct-PR.md
+  test that condition for ANY terminal state                             1
+  an unrecognised terminal state is still terminal                       1
+  gh pr checks <pr> --watch --fail-fast                                  1
+  no-mistakes axi run --wait                                             1
+  a declared wait with nothing watching it does not resume by itself     1
+  need firstmate to wake you                                             1
+  what is left" note is not a stopping                                   1
+  never leave a parked gate across the end of your turn                  0
+  gh pr checks --watch WITHOUT --fail-fast                               0
+  blocks until terminality ... axi status (wrong)                        0
+== brief-gerrit.md
+  test that condition for ANY terminal state                             1
+  an unrecognised terminal state is still terminal                       1
+  gh pr checks <pr> --watch --fail-fast                                  1
+  no-mistakes axi run --wait                                             1
+  a declared wait with nothing watching it does not resume by itself     1
+  need firstmate to wake you                                             1
+  what is left" note is not a stopping                                   1
+  never leave a parked gate across the end of your turn                  0
+  gh pr checks --watch WITHOUT --fail-fast                               0
+  blocks until terminality ... axi status (wrong)                        0
+== brief-local-only.md
+  test that condition for ANY terminal state                             1
+  an unrecognised terminal state is still terminal                       1
+  gh pr checks <pr> --watch --fail-fast                                  1
+  no-mistakes axi run --wait                                             1
+  a declared wait with nothing watching it does not resume by itself     1
+  need firstmate to wake you                                             1
+  what is left" note is not a stopping                                   1
+  never leave a parked gate across the end of your turn                  0
+  gh pr checks --watch WITHOUT --fail-fast                               0
+  blocks until terminality ... axi status (wrong)                        0
+== brief-no-mistakes.md
+  test that condition for ANY terminal state                             1
+  an unrecognised terminal state is still terminal                       1
+  gh pr checks <pr> --watch --fail-fast                                  1
+  no-mistakes axi run --wait                                             1
+  a declared wait with nothing watching it does not resume by itself     1
+  need firstmate to wake you                                             1
+  what is left" note is not a stopping                                   1
+  never leave a parked gate across the end of your turn                  1
+  gh pr checks --watch WITHOUT --fail-fast                               0
+  blocks until terminality ... axi status (wrong)                        0
+== brief-scout.md
+  test that condition for ANY terminal state                             1
+  an unrecognised terminal state is still terminal                       1
+  gh pr checks <pr> --watch --fail-fast                                  1
+  no-mistakes axi run --wait                                             1
+  a declared wait with nothing watching it does not resume by itself     1
+  need firstmate to wake you                                             1
+  what is left" note is not a stopping                                   0
+  never leave a parked gate across the end of your turn                  0
+  gh pr checks --watch WITHOUT --fail-fast                               0
+  blocks until terminality ... axi status (wrong)                        0
+
+== excerpt (no-mistakes ship brief)
+42:   A mid-task `working:` line (including setup complete) is nonterminal, and so is any status
+43:   naming work still left that nothing is blocking - an honest "what is left" note is not a stopping
+46:   Before ending your turn with your own background shell or monitor still running, or before waiting on your own pipeline run or a long foreground command, append `paused [at=<epoch>]: {job and completion condition}` to the status file; a declared wait with nothing watching it does not resume by itself, so either leave a blocking command running that returns when the condition clears, or say in that line that you need firstmate to wake you.
+47:   Name what you are waiting for and the resume condition, and test that condition for ANY terminal state - what the result concluded, success or failure - never one expected value like `succeeded` or an all-green read: a different terminal outcome loops forever against a condition that already resolved, and an unrecognised terminal state is still terminal.
+48:   Where a command blocks until terminality for you - `gh pr checks <pr> --watch --fail-fast` for PR checks, the drive call's own return for the pipeline (`no-mistakes axi run --wait`, reattaching by re-running `no-mistakes axi run`) - resume on it rather than a hand-written value match, and do not repeat the declaration on every poll.
+50:   Firstmate may still raise one first-sight alert; the declared wait then uses the existing long recheck cadence instead of repeated possible-wedge alarms.
+113:A gate shows as `awaiting_agent: parked` in `no-mistakes axi status` and advances only when you respond to it; never leave a parked gate across the end of your turn, and only an ask-user finding is ever escalate-and-stop (below).
